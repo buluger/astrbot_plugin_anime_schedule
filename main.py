@@ -50,8 +50,8 @@ HELP_TEXT = (
     "📺 番剧追番表指令一览\n"
     "1. 番剧上传 周X 名称 + 图片：添加番剧（可附图或引用带图消息）\n"
     "2. 番剧图 / 番剧列表：生成每周追番长图\n"
-    "3. 今日番剧：查看今天更新的番剧（附图+文字）\n"
-    "4. 番剧 周X：查看指定星期的番剧文字列表\n"
+    "3. 今日番剧：查看今天更新的番剧（文字列表 + 单行拼接长图）\n"
+    "4. 番剧 周X：查看指定星期的番剧（文字列表 + 单行拼接长图）\n"
     "5. 删除番剧 周X 编号：删除某天指定番剧\n"
     "6. 清空番剧 周X / 清空番剧 全部：清除某天或全部番剧\n"
     "7. 番剧权限+数字：设置上传权限（Bot管理员）\n"
@@ -239,18 +239,9 @@ class AnimeSchedulePlugin(Star):
             text = f"{header}\n{text}"
         try:
             await self.context.send_message(umo, MessageChain().message(text))
-            for entry in entries:
-                image_name = entry.get("image")
-                title = (entry.get("title") or "").strip()
-                if not image_name:
-                    continue
-                full = os.path.join(self._group_dir(group_id), image_name)
-                if not os.path.isfile(full):
-                    continue
-                chain = MessageChain().file_image(full)
-                if title:
-                    chain = chain.message(f"\n{title}")
-                await self.context.send_message(umo, chain)
+            out = self._build_schedule_image(group_id, highlight_day=day_idx, only_day=day_idx)
+            if out:
+                await self.context.send_message(umo, MessageChain().file_image(out))
             return True
         except Exception as e:
             logger.error(f"番剧推送发送失败 group={group_id}: {e}")
@@ -388,7 +379,12 @@ class AnimeSchedulePlugin(Star):
             except Exception as e:
                 logger.warning(f"删除图片失败 {path}: {e}")
 
-    def _build_schedule_image(self, group_id: str, highlight_day: Optional[int] = None) -> Optional[str]:
+    def _build_schedule_image(
+        self,
+        group_id: str,
+        highlight_day: Optional[int] = None,
+        only_day: Optional[int] = None,
+    ) -> Optional[str]:
         if PILImage is None or ImageDraw is None:
             return None
 
@@ -400,10 +396,12 @@ class AnimeSchedulePlugin(Star):
         margin = 12
         canvas_w = 1080
         poster_area_w = canvas_w - margin * 2 - label_w - poster_gap
-        max_posters = max(1, max((len(schedule.get(str(i), [])) for i in range(1, 8)), default=1))
+        day_range = [only_day] if only_day is not None else list(range(1, 8))
+        max_posters = max(1, max((len(schedule.get(str(i), [])) for i in day_range), default=1))
         poster_w = max(120, int((poster_area_w - poster_gap * (max_posters - 1)) / max_posters))
         row_h = poster_h + 16
-        canvas_h = margin * 2 + row_h * 7 + row_gap * 6
+        num_rows = len(day_range)
+        canvas_h = margin * 2 + row_h * num_rows + row_gap * max(0, num_rows - 1)
 
         img = PILImage.new("RGB", (canvas_w, canvas_h), (18, 18, 20))
         draw = ImageDraw.Draw(img)
@@ -413,7 +411,7 @@ class AnimeSchedulePlugin(Star):
             return None
 
         y = margin
-        for day_idx in range(1, 8):
+        for day_idx in day_range:
             day_key = str(day_idx)
             entries = schedule.get(day_key, [])
             color = DAY_COLORS[day_idx - 1]
@@ -475,7 +473,8 @@ class AnimeSchedulePlugin(Star):
                     x_poster += poster_w + poster_gap
             y += row_h + row_gap
 
-        out_path = os.path.join(self._group_dir(group_id), f"schedule_{int(time.time())}.png")
+        prefix = f"day_{only_day}" if only_day is not None else "schedule"
+        out_path = os.path.join(self._group_dir(group_id), f"{prefix}_{int(time.time())}.png")
         img.save(out_path, format="PNG")
         return out_path
 
@@ -488,22 +487,17 @@ class AnimeSchedulePlugin(Star):
             lines.append(f"  {i}. {title}")
         return "\n".join(lines)
 
-    async def _yield_day_entries(self, event: AstrMessageEvent, group_id: str, day_idx: int):
+    async def _yield_day_row(self, event: AstrMessageEvent, group_id: str, day_idx: int):
         schedule = self._load_schedule(group_id)
         entries = schedule.get(str(day_idx), [])
         yield event.plain_result(self._format_day_entries_text(day_idx, entries))
-        if not entries:
+        if PILImage is None:
+            if entries:
+                yield event.plain_result("服务器未安装 Pillow，无法生成拼接图。请安装依赖：pip install Pillow")
             return
-        for entry in entries:
-            image_name = entry.get("image")
-            title = entry.get("title") or ""
-            if image_name:
-                full = os.path.join(self._group_dir(group_id), image_name)
-                if os.path.isfile(full):
-                    chain = [Comp.Image.fromFileSystem(full)]
-                    if title:
-                        chain.append(Comp.Plain(f"\n{title}"))
-                    yield event.chain_result(chain)
+        out = self._build_schedule_image(group_id, highlight_day=day_idx, only_day=day_idx)
+        if out:
+            yield event.image_result(out)
 
     @filter.command("番剧帮助", alias={"/番剧帮助", "番剧菜单"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -531,7 +525,7 @@ class AnimeSchedulePlugin(Star):
         event.call_llm = True
         group_id = str(event.get_group_id())
         day_idx = _today_weekday()
-        async for res in self._yield_day_entries(event, group_id, day_idx):
+        async for res in self._yield_day_row(event, group_id, day_idx):
             yield res
 
     @filter.command("番剧")
@@ -543,7 +537,7 @@ class AnimeSchedulePlugin(Star):
         if not day_idx:
             yield event.plain_result("用法：番剧 周X（如 番剧 周一）")
             return
-        async for res in self._yield_day_entries(event, group_id, day_idx):
+        async for res in self._yield_day_row(event, group_id, day_idx):
             yield res
 
     @filter.command("番剧上传", alias={"/番剧上传"})
