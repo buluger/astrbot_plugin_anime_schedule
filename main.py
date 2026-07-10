@@ -103,7 +103,7 @@ def _today_weekday() -> int:
     "anime_schedule",
     "buluge",
     "按周一至周日记录追番列表，支持图片+文字上传与周表长图生成",
-    "1.0.0",
+    "1.2.0",
 )
 class AnimeSchedulePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -395,11 +395,15 @@ class AnimeSchedulePlugin(Star):
         row_gap = 8
         margin = 12
         canvas_w = 1080
+        poster_pad_top = 8
+        title_gap = 6
+        title_line_h = 22
+        poster_pad_bottom = 10
+        row_h = poster_pad_top + poster_h + title_gap + title_line_h + poster_pad_bottom
         poster_area_w = canvas_w - margin * 2 - label_w - poster_gap
         day_range = [only_day] if only_day is not None else list(range(1, 8))
         max_posters = max(1, max((len(schedule.get(str(i), [])) for i in day_range), default=1))
         poster_w = max(120, int((poster_area_w - poster_gap * (max_posters - 1)) / max_posters))
-        row_h = poster_h + 16
         num_rows = len(day_range)
         canvas_h = margin * 2 + row_h * num_rows + row_gap * max(0, num_rows - 1)
 
@@ -452,22 +456,40 @@ class AnimeSchedulePlugin(Star):
                                 nh = max(1, int(src.height * ratio))
                                 resized = src.resize((nw, nh))
                                 px = x_poster + (poster_w - nw) // 2
-                                py = y + 8 + (poster_h - nh) // 2
+                                py = y + poster_pad_top + (poster_h - nh) // 2
                                 img.paste(resized, (px, py))
                         except Exception:
-                            draw.rectangle([x_poster, y + 8, x_poster + poster_w, y + 8 + poster_h], fill=(60, 60, 68))
-                            draw.text((x_poster + 8, y + poster_h // 2), "加载失败", fill=(200, 200, 200), font=font_title)
+                            draw.rectangle(
+                                [x_poster, y + poster_pad_top, x_poster + poster_w, y + poster_pad_top + poster_h],
+                                fill=(60, 60, 68),
+                            )
+                            draw.text((x_poster + 8, y + poster_pad_top + poster_h // 2), "加载失败", fill=(200, 200, 200), font=font_title)
                     else:
-                        draw.rectangle([x_poster, y + 8, x_poster + poster_w, y + 8 + poster_h], fill=(50, 50, 58))
-                        draw.text((x_poster + 8, y + poster_h // 2), "无封面", fill=(180, 180, 190), font=font_title)
+                        draw.rectangle(
+                            [x_poster, y + poster_pad_top, x_poster + poster_w, y + poster_pad_top + poster_h],
+                            fill=(50, 50, 58),
+                        )
+                        draw.text((x_poster + 8, y + poster_pad_top + poster_h // 2), "无封面", fill=(180, 180, 190), font=font_title)
 
                     if title and font_title:
                         title_show = title if len(title) <= 10 else title[:9] + "…"
                         tw2 = draw.textlength(title_show, font=font_title) if hasattr(draw, "textlength") else 80
+                        title_x = x_poster + max(0, (poster_w - tw2) / 2)
+                        title_y = y + poster_pad_top + poster_h + title_gap
+                        title_pad_x, title_pad_y = 4, 2
+                        draw.rectangle(
+                            [
+                                title_x - title_pad_x,
+                                title_y - title_pad_y,
+                                title_x + tw2 + title_pad_x,
+                                title_y + title_line_h,
+                            ],
+                            fill=(35, 35, 42),
+                        )
                         draw.text(
-                            (x_poster + max(0, (poster_w - tw2) / 2), y + 8 + poster_h + 2),
+                            (title_x, title_y),
                             title_show,
-                            fill=(220, 220, 230),
+                            fill=(245, 245, 250),
                             font=font_title,
                         )
                     x_poster += poster_w + poster_gap

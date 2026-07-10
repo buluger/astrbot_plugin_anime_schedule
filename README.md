@@ -145,7 +145,7 @@ data/plugin_data/astrbot_plugin_anime_schedule/<群号>/
 
 ## 版本
 
-当前版本：`v1.1.0`
+当前版本：`v1.2.0`
 
 ## 作者
 
