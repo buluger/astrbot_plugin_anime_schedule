@@ -1,0 +1,30 @@
+{
+  "upload_mode_default": {
+    "description": "默认上传权限：0=关闭，1=仅Bot管理员，2=全体成员",
+    "type": "int",
+    "hint": "群内可用「番剧权限」覆盖",
+    "obvious_hint": true,
+    "default": 2
+  },
+  "max_per_day_default": {
+    "description": "每天默认可添加番剧数量上限",
+    "type": "int",
+    "hint": "1~20，群内可用「番剧设置 每日上限」覆盖",
+    "obvious_hint": true,
+    "default": 10
+  },
+  "push_hour_default": {
+    "description": "默认定时推送小时（0~23）",
+    "type": "int",
+    "hint": "群内可用「番剧推送 时间」覆盖",
+    "obvious_hint": true,
+    "default": 8
+  },
+  "push_minute_default": {
+    "description": "默认定时推送分钟（0~59）",
+    "type": "int",
+    "hint": "群内可用「番剧推送 时间」覆盖",
+    "obvious_hint": true,
+    "default": 0
+  }
+}
