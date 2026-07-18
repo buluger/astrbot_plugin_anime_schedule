@@ -53,13 +53,15 @@ HELP_TEXT = (
     "3. 今日番剧：查看今天更新的番剧（文字列表 + 单行拼接长图）\n"
     "4. 番剧 周X：查看指定星期的番剧（文字列表 + 单行拼接长图）\n"
     "5. 删除番剧 周X 编号：删除某天指定番剧\n"
-    "6. 清空番剧 周X / 清空番剧 全部：清除某天或全部番剧\n"
-    "7. 番剧权限+数字：设置上传权限（Bot管理员）\n"
-    "8. 番剧设置 每日上限 数字：设置每天上限（Bot管理员）\n"
-    "9. 番剧推送 开启/关闭：开关本群每日定时推送\n"
-    "10. 番剧推送 时间 8:30：设置每日推送时间（Bot管理员）\n"
-    "11. 番剧推送 立即：立即推送今日番剧（测试用）\n"
-    "12. 番剧帮助：显示本帮助"
+    "6. 移动番剧 周X 编号 周Y：将番剧移到另一天\n"
+    "7. 交换番剧 周X 编号A 周Y 编号B：交换两部番剧位置\n"
+    "8. 清空番剧 周X / 清空番剧 全部：清除某天或全部番剧\n"
+    "9. 番剧权限+数字：设置上传权限（Bot管理员）\n"
+    "10. 番剧设置 每日上限 数字：设置每天上限（Bot管理员）\n"
+    "11. 番剧推送 开启/关闭：开关本群每日定时推送\n"
+    "12. 番剧推送 时间 8:30：设置每日推送时间（Bot管理员）\n"
+    "13. 番剧推送 立即：立即推送今日番剧（测试用）\n"
+    "14. 番剧帮助：显示本帮助"
 )
 
 
@@ -103,7 +105,7 @@ def _today_weekday() -> int:
     "anime_schedule",
     "buluge",
     "按周一至周日记录追番列表，支持图片+文字上传与周表长图生成",
-    "1.2.0",
+    "1.4.0",
 )
 class AnimeSchedulePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -655,6 +657,117 @@ class AnimeSchedulePlugin(Star):
         schedule[day_key] = entries
         self._save_schedule(group_id, schedule)
         yield event.plain_result(f"✅ 已删除 {DAY_NAMES[day_idx - 1]} #{idx}：{removed.get('title', '')}")
+
+    @filter.command("移动番剧", alias={"/移动番剧"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def cmd_move(self, event: AstrMessageEvent, from_day: str = "", index: str = "", to_day: str = ""):
+        event.call_llm = True
+        group_id = str(event.get_group_id())
+        user_id = str(event.get_sender_id())
+        if not self._can_manage(user_id):
+            yield event.plain_result("权限不足，仅 Bot 管理员可移动番剧")
+            return
+
+        from_idx = _parse_day_token(from_day)
+        to_idx = _parse_day_token(to_day)
+        if not from_idx or not to_idx or not str(index).strip().isdigit():
+            yield event.plain_result("用法：移动番剧 周X 编号 周Y（如 移动番剧 周一 1 周三）")
+            return
+        if from_idx == to_idx:
+            yield event.plain_result("源星期与目标星期相同，无需移动")
+            return
+
+        idx = int(index)
+        schedule = self._load_schedule(group_id)
+        from_key = str(from_idx)
+        to_key = str(to_idx)
+        entries = schedule.get(from_key, [])
+        if idx < 1 or idx > len(entries):
+            yield event.plain_result(f"编号超出范围，{DAY_NAMES[from_idx - 1]} 当前共 {len(entries)} 部")
+            return
+
+        settings = self._load_settings(group_id)
+        max_per_day = max(1, min(20, int(settings.get("max_per_day", self.max_per_day_default))))
+        if len(schedule.get(to_key, [])) >= max_per_day:
+            yield event.plain_result(
+                f"❌ {DAY_NAMES[to_idx - 1]} 已达上限（{max_per_day} 部），请先删除或清空"
+            )
+            return
+
+        moved = entries.pop(idx - 1)
+        schedule[from_key] = entries
+        schedule.setdefault(to_key, []).append(moved)
+        self._save_schedule(group_id, schedule)
+        new_idx = len(schedule[to_key])
+        yield event.plain_result(
+            f"✅ 已将 {DAY_NAMES[from_idx - 1]} #{idx}「{moved.get('title', '')}」"
+            f"移动到 {DAY_NAMES[to_idx - 1]}（#{new_idx}）"
+        )
+
+    @filter.command("交换番剧", alias={"/交换番剧"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def cmd_swap(
+        self,
+        event: AstrMessageEvent,
+        day_a: str = "",
+        index_a: str = "",
+        day_b: str = "",
+        index_b: str = "",
+    ):
+        event.call_llm = True
+        group_id = str(event.get_group_id())
+        user_id = str(event.get_sender_id())
+        if not self._can_manage(user_id):
+            yield event.plain_result("权限不足，仅 Bot 管理员可交换番剧")
+            return
+
+        a_day = _parse_day_token(day_a)
+        b_day = _parse_day_token(day_b)
+        if (
+            not a_day
+            or not b_day
+            or not str(index_a).strip().isdigit()
+            or not str(index_b).strip().isdigit()
+        ):
+            yield event.plain_result(
+                "用法：交换番剧 周X 编号A 周Y 编号B（如 交换番剧 周一 1 周三 2）"
+            )
+            return
+
+        a_idx = int(index_a)
+        b_idx = int(index_b)
+        if a_day == b_day and a_idx == b_idx:
+            yield event.plain_result("两部番剧相同，无需交换")
+            return
+
+        schedule = self._load_schedule(group_id)
+        a_key = str(a_day)
+        b_key = str(b_day)
+        a_entries = schedule.get(a_key, [])
+        b_entries = schedule.get(b_key, [])
+
+        if a_idx < 1 or a_idx > len(a_entries):
+            yield event.plain_result(
+                f"编号超出范围，{DAY_NAMES[a_day - 1]} 当前共 {len(a_entries)} 部"
+            )
+            return
+        if b_idx < 1 or b_idx > len(b_entries):
+            yield event.plain_result(
+                f"编号超出范围，{DAY_NAMES[b_day - 1]} 当前共 {len(b_entries)} 部"
+            )
+            return
+
+        title_a = a_entries[a_idx - 1].get("title", "")
+        title_b = b_entries[b_idx - 1].get("title", "")
+        a_entries[a_idx - 1], b_entries[b_idx - 1] = b_entries[b_idx - 1], a_entries[a_idx - 1]
+        schedule[a_key] = a_entries
+        schedule[b_key] = b_entries
+        self._save_schedule(group_id, schedule)
+        yield event.plain_result(
+            f"✅ 已交换：\n"
+            f"  {DAY_NAMES[a_day - 1]} #{a_idx}「{title_a}」 ↔ "
+            f"{DAY_NAMES[b_day - 1]} #{b_idx}「{title_b}」"
+        )
 
     @filter.command("清空番剧", alias={"/清空番剧"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
