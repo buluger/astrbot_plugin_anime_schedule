@@ -46,6 +46,14 @@ DAY_COLORS = [
     (150, 160, 210),
 ]
 
+# 1=仅Bot管理员 2=仅群主 3=群主+管理 4=全员
+PERM_LEVELS = {
+    1: "仅 Bot 管理员",
+    2: "仅群主",
+    3: "群主+管理员",
+    4: "全员",
+}
+
 HELP_TEXT = (
     "📺 番剧追番表指令一览\n"
     "1. 番剧上传 周X 名称 + 图片：添加番剧（可附图或引用带图消息）\n"
@@ -56,10 +64,10 @@ HELP_TEXT = (
     "6. 移动番剧 周X 编号 周Y：将番剧移到另一天\n"
     "7. 交换番剧 周X 编号A 周Y 编号B：交换两部番剧位置\n"
     "8. 清空番剧 周X / 清空番剧 全部：清除某天或全部番剧\n"
-    "9. 番剧权限+数字：设置上传权限（Bot管理员）\n"
-    "10. 番剧设置 每日上限 数字：设置每天上限（Bot管理员）\n"
+    "9. 番剧权限+数字：设置操作权限（1仅Bot管理/2仅群主/3群主+管理/4全员）\n"
+    "10. 番剧设置 每日上限 数字：设置每天上限\n"
     "11. 番剧推送 开启/关闭：开关本群每日定时推送\n"
-    "12. 番剧推送 时间 8:30：设置每日推送时间（Bot管理员）\n"
+    "12. 番剧推送 时间 8:30：设置每日推送时间\n"
     "13. 番剧推送 立即：立即推送今日番剧（测试用）\n"
     "14. 番剧帮助：显示本帮助"
 )
@@ -105,7 +113,7 @@ def _today_weekday() -> int:
     "anime_schedule",
     "buluge",
     "按周一至周日记录追番列表，支持图片+文字上传与周表长图生成",
-    "1.4.0",
+    "1.5.0",
 )
 class AnimeSchedulePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -115,7 +123,13 @@ class AnimeSchedulePlugin(Star):
         bot_config = context.get_config()
         admins = bot_config.get("admins_id", [])
         self.admins = [str(a) for a in admins] if admins else []
-        self.upload_mode_default = int(getattr(config, "upload_mode_default", None) or 2)
+        # 兼容旧配置 upload_mode_default；默认 3=群主+管理员
+        if getattr(config, "perm_mode_default", None) is not None:
+            self.perm_mode_default = self._clamp_perm_mode(config.perm_mode_default, 3)
+        elif getattr(config, "upload_mode_default", None) is not None:
+            self.perm_mode_default = self._migrate_legacy_upload_mode(config.upload_mode_default, 3)
+        else:
+            self.perm_mode_default = 3
         self.max_per_day_default = int(getattr(config, "max_per_day_default", None) or 10)
         self.push_hour_default = int(getattr(config, "push_hour_default", None) or 8)
         self.push_minute_default = int(getattr(config, "push_minute_default", None) or 0)
@@ -135,9 +149,30 @@ class AnimeSchedulePlugin(Star):
             self._push_task = None
         logger.info("番剧追番表：定时推送任务已停止")
 
+    @staticmethod
+    def _clamp_perm_mode(value, fallback: int = 3) -> int:
+        try:
+            mode = int(value)
+        except (TypeError, ValueError):
+            return fallback
+        return mode if mode in PERM_LEVELS else fallback
+
+    @staticmethod
+    def _migrate_legacy_upload_mode(value, fallback: int = 3) -> int:
+        """旧 upload_mode：0关闭 / 1仅Bot / 2全员 → 新 perm_mode。"""
+        try:
+            old = int(value)
+        except (TypeError, ValueError):
+            return fallback
+        return {0: 1, 1: 1, 2: 4}.get(old, fallback)
+
+    def _get_perm_mode(self, group_id: str) -> int:
+        settings = self._load_settings(group_id)
+        return self._clamp_perm_mode(settings.get("perm_mode"), self.perm_mode_default)
+
     def _default_settings(self) -> dict:
         return {
-            "upload_mode": self.upload_mode_default,
+            "perm_mode": self.perm_mode_default,
             "max_per_day": self.max_per_day_default,
             "push_enabled": False,
             "push_hour": self.push_hour_default,
@@ -165,8 +200,13 @@ class AnimeSchedulePlugin(Star):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
+            if "perm_mode" not in data and "upload_mode" in data:
+                data["perm_mode"] = self._migrate_legacy_upload_mode(
+                    data.get("upload_mode"), self.perm_mode_default
+                )
             for key, value in defaults.items():
                 data.setdefault(key, value)
+            data["perm_mode"] = self._clamp_perm_mode(data.get("perm_mode"), self.perm_mode_default)
             return data
         except Exception as e:
             logger.warning(f"加载番剧设置失败: {e}")
@@ -279,20 +319,49 @@ class AnimeSchedulePlugin(Star):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(schedule, f, ensure_ascii=False, indent=2)
 
-    def is_admin(self, user_id: str) -> bool:
+    def is_bot_admin(self, user_id: str) -> bool:
         return str(user_id) in self.admins
 
-    def _can_upload(self, group_id: str, user_id: str) -> tuple[bool, str]:
-        settings = self._load_settings(group_id)
-        mode = int(settings.get("upload_mode", self.upload_mode_default))
-        if mode == 0:
-            return False, "投稿系统未开启，请联系 Bot 管理员发送「番剧权限」设置"
-        if mode == 1 and not self.is_admin(user_id):
-            return False, "当前为「仅管理员可上传」，请联系 Bot 管理员"
-        return True, ""
+    def _get_group_role(self, event: AstrMessageEvent) -> str:
+        """返回群身份：owner / admin / member。"""
+        sender = getattr(event.message_obj, "sender", None)
+        role = getattr(sender, "role", None) if sender else None
+        if isinstance(role, str) and role.lower() in ("owner", "admin", "member"):
+            return role.lower()
 
-    def _can_manage(self, user_id: str) -> bool:
-        return self.is_admin(user_id)
+        raw = getattr(event.message_obj, "raw_message", None)
+        if isinstance(raw, dict):
+            raw_role = (raw.get("sender") or {}).get("role")
+            if isinstance(raw_role, str) and raw_role.lower() in ("owner", "admin", "member"):
+                return raw_role.lower()
+
+        # AstrBot 会把群主/管理都标成 event.role=admin，无法区分时按 admin 处理
+        if getattr(event, "role", "") == "admin" or (
+            hasattr(event, "is_admin") and callable(event.is_admin) and event.is_admin()
+        ):
+            return "admin"
+        return "member"
+
+    def _check_perm(self, event: AstrMessageEvent, group_id: str, action: str = "操作") -> tuple[bool, str]:
+        """按四级权限校验：1仅Bot管理 / 2仅群主 / 3群主+管理 / 4全员。Bot 管理员始终放行。"""
+        user_id = str(event.get_sender_id())
+        if self.is_bot_admin(user_id):
+            return True, ""
+
+        mode = self._get_perm_mode(group_id)
+        label = PERM_LEVELS.get(mode, str(mode))
+        deny = f"权限不足，当前为「{label}」，无法{action}"
+
+        if mode == 4:
+            return True, ""
+
+        role = self._get_group_role(event)
+        if mode == 3 and role in ("owner", "admin"):
+            return True, ""
+        if mode == 2 and role == "owner":
+            return True, ""
+        # mode == 1：仅 Bot 管理员（上面已放行）
+        return False, deny
 
     async def _save_bytes_as_image(self, group_id: str, data: bytes) -> str:
         filename = f"anime_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}.jpg"
@@ -572,7 +641,7 @@ class AnimeSchedulePlugin(Star):
         user_id = str(event.get_sender_id())
         msg = event.message_str.strip()
 
-        can, deny = self._can_upload(group_id, user_id)
+        can, deny = self._check_perm(event, group_id, "上传番剧")
         if not can:
             yield event.plain_result(f"❌ {deny}")
             return
@@ -634,9 +703,9 @@ class AnimeSchedulePlugin(Star):
     async def cmd_delete_one(self, event: AstrMessageEvent, day_token: str = "", index: str = ""):
         event.call_llm = True
         group_id = str(event.get_group_id())
-        user_id = str(event.get_sender_id())
-        if not self._can_manage(user_id):
-            yield event.plain_result("权限不足，仅 Bot 管理员可删除番剧")
+        can, deny = self._check_perm(event, group_id, "删除番剧")
+        if not can:
+            yield event.plain_result(f"❌ {deny}")
             return
 
         day_idx = _parse_day_token(day_token)
@@ -663,9 +732,9 @@ class AnimeSchedulePlugin(Star):
     async def cmd_move(self, event: AstrMessageEvent, from_day: str = "", index: str = "", to_day: str = ""):
         event.call_llm = True
         group_id = str(event.get_group_id())
-        user_id = str(event.get_sender_id())
-        if not self._can_manage(user_id):
-            yield event.plain_result("权限不足，仅 Bot 管理员可移动番剧")
+        can, deny = self._check_perm(event, group_id, "移动番剧")
+        if not can:
+            yield event.plain_result(f"❌ {deny}")
             return
 
         from_idx = _parse_day_token(from_day)
@@ -716,9 +785,9 @@ class AnimeSchedulePlugin(Star):
     ):
         event.call_llm = True
         group_id = str(event.get_group_id())
-        user_id = str(event.get_sender_id())
-        if not self._can_manage(user_id):
-            yield event.plain_result("权限不足，仅 Bot 管理员可交换番剧")
+        can, deny = self._check_perm(event, group_id, "交换番剧")
+        if not can:
+            yield event.plain_result(f"❌ {deny}")
             return
 
         a_day = _parse_day_token(day_a)
@@ -774,9 +843,9 @@ class AnimeSchedulePlugin(Star):
     async def cmd_clear(self, event: AstrMessageEvent, target: str = ""):
         event.call_llm = True
         group_id = str(event.get_group_id())
-        user_id = str(event.get_sender_id())
-        if not self._can_manage(user_id):
-            yield event.plain_result("权限不足，仅 Bot 管理员可清空番剧")
+        can, deny = self._check_perm(event, group_id, "清空番剧")
+        if not can:
+            yield event.plain_result(f"❌ {deny}")
             return
 
         target = (target or "").strip()
@@ -811,40 +880,41 @@ class AnimeSchedulePlugin(Star):
     async def cmd_upload_mode(self, event: AstrMessageEvent):
         event.call_llm = True
         group_id = str(event.get_group_id())
-        user_id = str(event.get_sender_id())
-        if not self._can_manage(user_id):
-            yield event.plain_result("权限不足，仅 Bot 管理员可设置")
-            return
-
         msg = event.message_str.strip()
         m = re.search(r"(\d+)", msg)
         settings = self._load_settings(group_id)
-        current = int(settings.get("upload_mode", self.upload_mode_default))
+        current = self._get_perm_mode(group_id)
+        help_lines = "\n".join(f"{k}：{v}" for k, v in PERM_LEVELS.items())
         if not m:
             yield event.plain_result(
-                f"当前上传权限：{current}\n"
-                "0：关闭上传\n1：仅 Bot 管理员可上传\n2：全体成员可上传\n"
-                "设置示例：番剧权限2"
+                f"当前操作权限：{current}（{PERM_LEVELS[current]}）\n"
+                f"{help_lines}\n"
+                "设置示例：番剧权限3\n"
+                "说明：该权限同时作用于上传、删除、移动、交换、清空、设置与推送管理"
             )
             return
 
-        mode = int(m.group(1))
-        if mode not in (0, 1, 2):
-            yield event.plain_result("模式只能是 0、1 或 2")
+        can, deny = self._check_perm(event, group_id, "修改权限")
+        if not can:
+            yield event.plain_result(f"❌ {deny}")
             return
-        settings["upload_mode"] = mode
+
+        mode = int(m.group(1))
+        if mode not in PERM_LEVELS:
+            yield event.plain_result("模式只能是 1、2、3 或 4")
+            return
+        settings["perm_mode"] = mode
         self._save_settings(group_id, settings)
-        labels = {0: "关闭上传", 1: "仅管理员可上传", 2: "全体成员可上传"}
-        yield event.plain_result(f"✅ 番剧上传权限已设为：{labels[mode]}")
+        yield event.plain_result(f"✅ 番剧操作权限已设为：{mode}（{PERM_LEVELS[mode]}）")
 
     @filter.command("番剧设置")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def cmd_settings(self, event: AstrMessageEvent, feature: str = "", value: str = ""):
         event.call_llm = True
         group_id = str(event.get_group_id())
-        user_id = str(event.get_sender_id())
-        if not self._can_manage(user_id):
-            yield event.plain_result("权限不足，仅 Bot 管理员可设置")
+        can, deny = self._check_perm(event, group_id, "修改设置")
+        if not can:
+            yield event.plain_result(f"❌ {deny}")
             return
 
         settings = self._load_settings(group_id)
@@ -853,10 +923,11 @@ class AnimeSchedulePlugin(Star):
             push_enabled = bool(settings.get("push_enabled"))
             push_hour = int(settings.get("push_hour", self.push_hour_default))
             push_minute = int(settings.get("push_minute", self.push_minute_default))
+            perm = self._get_perm_mode(group_id)
             yield event.plain_result(
                 f"番剧设置\n"
                 f"每日上限：{settings.get('max_per_day', self.max_per_day_default)}\n"
-                f"上传权限：{settings.get('upload_mode', self.upload_mode_default)}\n"
+                f"操作权限：{perm}（{PERM_LEVELS[perm]}）\n"
                 f"定时推送：{'开启' if push_enabled else '关闭'}（{self._format_push_time(push_hour, push_minute)}）\n"
                 "设置示例：番剧设置 每日上限 10"
             )
@@ -879,7 +950,6 @@ class AnimeSchedulePlugin(Star):
     async def cmd_push(self, event: AstrMessageEvent):
         event.call_llm = True
         group_id = str(event.get_group_id())
-        user_id = str(event.get_sender_id())
         msg = event.message_str.strip()
         settings = self._load_settings(group_id)
 
@@ -900,8 +970,9 @@ class AnimeSchedulePlugin(Star):
             return
 
         if msg in ("番剧推送 开启", "/番剧推送 开启"):
-            if not self._can_manage(user_id):
-                yield event.plain_result("权限不足，仅 Bot 管理员可设置定时推送")
+            can, deny = self._check_perm(event, group_id, "设置定时推送")
+            if not can:
+                yield event.plain_result(f"❌ {deny}")
                 return
             settings["push_enabled"] = True
             settings["push_umo"] = event.unified_msg_origin
@@ -914,8 +985,9 @@ class AnimeSchedulePlugin(Star):
             return
 
         if msg in ("番剧推送 关闭", "/番剧推送 关闭"):
-            if not self._can_manage(user_id):
-                yield event.plain_result("权限不足，仅 Bot 管理员可设置定时推送")
+            can, deny = self._check_perm(event, group_id, "设置定时推送")
+            if not can:
+                yield event.plain_result(f"❌ {deny}")
                 return
             settings["push_enabled"] = False
             self._save_settings(group_id, settings)
@@ -923,8 +995,9 @@ class AnimeSchedulePlugin(Star):
             return
 
         if msg.startswith("番剧推送 时间") or msg.startswith("/番剧推送 时间"):
-            if not self._can_manage(user_id):
-                yield event.plain_result("权限不足，仅 Bot 管理员可设置定时推送")
+            can, deny = self._check_perm(event, group_id, "设置定时推送")
+            if not can:
+                yield event.plain_result(f"❌ {deny}")
                 return
             time_text = re.sub(r"^/?番剧推送\s+时间\s*", "", msg).strip()
             parsed = self._parse_push_time(time_text)
@@ -940,8 +1013,9 @@ class AnimeSchedulePlugin(Star):
             return
 
         if msg in ("番剧推送 立即", "/番剧推送 立即"):
-            if not self._can_manage(user_id):
-                yield event.plain_result("权限不足，仅 Bot 管理员可测试推送")
+            can, deny = self._check_perm(event, group_id, "测试推送")
+            if not can:
+                yield event.plain_result(f"❌ {deny}")
                 return
             umo = settings.get("push_umo") or event.unified_msg_origin
             ok = await self._send_today_push(group_id, umo, header="📺 今日番剧（手动测试推送）")

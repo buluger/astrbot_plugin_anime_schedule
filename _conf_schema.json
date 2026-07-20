@@ -1,10 +1,10 @@
 {
-  "upload_mode_default": {
-    "description": "默认上传权限：0=关闭，1=仅Bot管理员，2=全体成员",
+  "perm_mode_default": {
+    "description": "默认操作权限：1=仅Bot管理员，2=仅群主，3=群主+管理员，4=全员",
     "type": "int",
-    "hint": "群内可用「番剧权限」覆盖",
+    "hint": "作用于上传/删除/移动/交换/清空/设置/推送；群内可用「番剧权限」覆盖",
     "obvious_hint": true,
-    "default": 2
+    "default": 3
   },
   "max_per_day_default": {
     "description": "每天默认可添加番剧数量上限",
