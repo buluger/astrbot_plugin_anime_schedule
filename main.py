@@ -55,6 +55,11 @@ PERM_LEVELS = {
 }
 
 DEFAULT_MAX_EP = 12
+BANGUMI_API = "https://api.bgm.tv"
+BANGUMI_UA = (
+    "astrbot_plugin_anime_schedule/1.7 "
+    "(https://github.com/buluger/astrbot_plugin_anime_schedule)"
+)
 
 # 表情回应：标记「看过」的系统表情 / emoji（NapCat likes.emoji_id）
 DONE_REACTION_IDS = {
@@ -83,15 +88,15 @@ NUM_REACTION_IDS = {
 
 HELP_TEXT = (
     "📺 番剧追番表指令一览\n"
-    "1. 番剧上传 周X 名称 [总集数] + 图片：添加番剧（总集数默认12）\n"
+    "1. 番剧上传 周X 名称 [总集数] + 图片：添加番剧（未填总集数时自动查 Bangumi）\n"
     "2. 番剧图 / 番剧列表：生成每周追番长图\n"
     "3. 今日番剧：查看今天更新的番剧（含进度）\n"
     "4. 番剧 周X：查看指定星期的番剧（含进度）\n"
-    "5. 已看 周X 编号：标记看过一集（已看+1）\n"
+    "5. 已看 周X / 已看 周X 编号：标记看过（只写周X则当天全部）\n"
     "6. 已看全部：今日列表全部标记看过\n"
-    "7. 撤回 周X 编号：撤回最近一次已看\n"
-    "8. 番剧已看 周X 编号 N：直接设置已看集数\n"
-    "9. 番剧上限 周X 编号 N：设置总集数\n"
+    "7. 撤回 周X / 撤回 周X 编号：撤回已看（只写周X则当天全部）\n"
+    "8. 番剧已看 周X N / 周X 编号 N：设置已看集数（无编号则当天全部）\n"
+    "9. 番剧上限 周X / 周X 编号 [N]：设置或同步总集数（只写周X则当天全部）\n"
     "10. 删除/移动/交换/清空番剧：管理列表\n"
     "11. 番剧权限1~4：设置操作权限\n"
     "12. 番剧推送 开启/关闭/时间/立即：定时推送\n"
@@ -223,11 +228,142 @@ def _undo_watched_one(entry: dict) -> tuple[bool, str]:
     )
 
 
+def _pick_bangumi_eps(detail: dict) -> Optional[int]:
+    """从 Bangumi 条目详情解析总集数。"""
+    for key in ("total_episodes", "eps", "eps_count"):
+        val = detail.get(key)
+        if isinstance(val, int) and val > 0:
+            return min(999, val)
+        if isinstance(val, str) and val.isdigit() and int(val) > 0:
+            return min(999, int(val))
+    for item in detail.get("infobox") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("key") in ("话数", "集数"):
+            val = item.get("value")
+            if isinstance(val, (int, float)) and int(val) > 0:
+                return min(999, int(val))
+            if isinstance(val, str):
+                m = re.search(r"(\d+)", val)
+                if m and int(m.group(1)) > 0:
+                    return min(999, int(m.group(1)))
+    return None
+
+
+def _bangumi_name_score(title: str, item: dict) -> int:
+    """名称匹配分，越高越好。"""
+    title_n = re.sub(r"\s+", "", title).lower()
+    name_cn = re.sub(r"\s+", "", str(item.get("name_cn") or "")).lower()
+    name = re.sub(r"\s+", "", str(item.get("name") or "")).lower()
+    if not title_n:
+        return 0
+    if title_n == name_cn or title_n == name:
+        return 100
+    if title_n and (title_n in name_cn or title_n in name):
+        return 80
+    if name_cn and name_cn in title_n:
+        return 70
+    if name and name in title_n:
+        return 60
+    return 0
+
+
+async def fetch_bangumi_max_ep(title: str) -> tuple[Optional[int], Optional[int], str]:
+    """
+    按番名查询 Bangumi，返回 (max_ep, bangumi_id, message)。
+    失败时 max_ep 为 None。
+    """
+    title = (title or "").strip()
+    if not title:
+        return None, None, "番名为空"
+    headers = {
+        "User-Agent": BANGUMI_UA,
+        "Accept": "application/json",
+    }
+    timeout = aiohttp.ClientTimeout(total=12)
+    try:
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+            subject = None
+            # 优先新版搜索
+            try:
+                async with session.post(
+                    f"{BANGUMI_API}/v0/search/subjects",
+                    json={
+                        "keyword": title,
+                        "filter": {"type": [2]},
+                    },
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        items = data.get("data") if isinstance(data, dict) else None
+                        if isinstance(items, list) and items:
+                            ranked = sorted(
+                                items,
+                                key=lambda x: _bangumi_name_score(title, x),
+                                reverse=True,
+                            )
+                            if _bangumi_name_score(title, ranked[0]) > 0 or len(ranked) == 1:
+                                subject = ranked[0]
+            except Exception as e:
+                logger.warning(f"Bangumi v0 搜索失败: {e}")
+
+            # 回退旧版搜索
+            if subject is None:
+                from urllib.parse import quote
+
+                url = (
+                    f"{BANGUMI_API}/search/subject/{quote(title)}"
+                    f"?type=2&responseGroup=small&max_results=10"
+                )
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        return None, None, f"Bangumi 搜索失败（HTTP {resp.status}）"
+                    data = await resp.json(content_type=None)
+                    items = []
+                    if isinstance(data, dict):
+                        items = data.get("list") or data.get("data") or []
+                    elif isinstance(data, list):
+                        items = data
+                    if not items:
+                        return None, None, f"Bangumi 未找到「{title}」"
+                    ranked = sorted(
+                        items,
+                        key=lambda x: _bangumi_name_score(title, x),
+                        reverse=True,
+                    )
+                    subject = ranked[0]
+
+            sid = subject.get("id")
+            if sid is None:
+                return None, None, f"Bangumi 未找到「{title}」"
+            bgm_name = subject.get("name_cn") or subject.get("name") or title
+
+            # 详情取更准确的集数
+            detail = subject
+            try:
+                async with session.get(f"{BANGUMI_API}/v0/subjects/{int(sid)}") as resp:
+                    if resp.status == 200:
+                        detail = await resp.json()
+            except Exception as e:
+                logger.warning(f"Bangumi 详情失败，使用搜索结果: {e}")
+
+            eps = _pick_bangumi_eps(detail)
+            matched = detail.get("name_cn") or detail.get("name") or bgm_name
+            if not eps:
+                return None, int(sid), f"已匹配「{matched}」，但 Bangumi 暂无总集数"
+            return eps, int(sid), f"已匹配 Bangumi「{matched}」（ID {sid}）→ {eps} 集"
+    except asyncio.TimeoutError:
+        return None, None, "查询 Bangumi 超时"
+    except Exception as e:
+        logger.error(f"查询 Bangumi 失败: {e}")
+        return None, None, f"查询 Bangumi 失败：{e}"
+
+
 @register(
     "anime_schedule",
     "buluge",
     "按周一至周日记录追番列表，支持进度追踪、表情回应与周表长图",
-    "1.6.0",
+    "1.7.0",
 )
 class AnimeSchedulePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -824,7 +960,7 @@ class AnimeSchedulePlugin(Star):
         if with_tip and entries:
             text += (
                 "\n————\n"
-                "更新进度：已看 编号 / 已看全部\n"
+                "更新进度：已看 周X / 已看 编号 / 已看全部\n"
                 "表情回应：数字表情=对应编号，👍/OK/强=全部看过"
             )
         return text
@@ -856,14 +992,111 @@ class AnimeSchedulePlugin(Star):
             self._save_schedule(group_id, schedule)
         return messages
 
-    def _apply_mark_all_today(self, group_id: str) -> list[str]:
-        day_idx = _today_weekday()
+    def _apply_mark_day(self, group_id: str, day_idx: int) -> list[str]:
         schedule = self._load_schedule(group_id)
         entries = schedule.get(str(day_idx), [])
         if not entries:
-            return ["今日暂无番剧"]
+            return [f"{DAY_NAMES[day_idx - 1]} 暂无番剧"]
         indices = list(range(1, len(entries) + 1))
         return self._apply_mark_indices(group_id, day_idx, indices)
+
+    def _apply_mark_all_today(self, group_id: str) -> list[str]:
+        return self._apply_mark_day(group_id, _today_weekday())
+
+    def _apply_undo_indices(self, group_id: str, day_idx: int, indices: list[int]) -> list[str]:
+        schedule = self._load_schedule(group_id)
+        day_key = str(day_idx)
+        entries = schedule.get(day_key, [])
+        messages = []
+        changed = False
+        for idx in indices:
+            if idx < 1 or idx > len(entries):
+                messages.append(f"#{idx} 编号无效")
+                continue
+            ok, msg = _undo_watched_one(entries[idx - 1])
+            messages.append(msg if ok else f"❌ {msg}")
+            if ok:
+                changed = True
+        if changed:
+            schedule[day_key] = entries
+            self._save_schedule(group_id, schedule)
+        return messages
+
+    def _apply_undo_day(self, group_id: str, day_idx: int) -> list[str]:
+        schedule = self._load_schedule(group_id)
+        entries = schedule.get(str(day_idx), [])
+        if not entries:
+            return [f"{DAY_NAMES[day_idx - 1]} 暂无番剧"]
+        return self._apply_undo_indices(group_id, day_idx, list(range(1, len(entries) + 1)))
+
+    def _apply_set_watched_indices(
+        self, group_id: str, day_idx: int, indices: list[int], watched: int
+    ) -> list[str]:
+        schedule = self._load_schedule(group_id)
+        day_key = str(day_idx)
+        entries = schedule.get(day_key, [])
+        messages = []
+        changed = False
+        for idx in indices:
+            if idx < 1 or idx > len(entries):
+                messages.append(f"#{idx} 编号无效")
+                continue
+            entry = _normalize_entry(entries[idx - 1])
+            n = max(0, min(entry["max_ep"], watched))
+            entry["watched_ep"] = n
+            entry["last_watched_date"] = _today_date_str() if n > 0 else None
+            messages.append(
+                f"「{entry.get('title', '')}」已看设为 {n} 集，"
+                f"应看第{_should_watch_ep(entry)}集/{entry['max_ep']}"
+            )
+            changed = True
+        if changed:
+            schedule[day_key] = entries
+            self._save_schedule(group_id, schedule)
+        return messages
+
+    async def _apply_max_ep_indices(
+        self,
+        group_id: str,
+        day_idx: int,
+        indices: list[int],
+        value: Optional[str] = None,
+    ) -> list[str]:
+        """value 为数字则手动设置；为空则 Bangumi 同步。"""
+        schedule = self._load_schedule(group_id)
+        day_key = str(day_idx)
+        entries = schedule.get(day_key, [])
+        messages = []
+        changed = False
+        manual = value is not None and str(value).strip().isdigit()
+        for idx in indices:
+            if idx < 1 or idx > len(entries):
+                messages.append(f"#{idx} 编号无效")
+                continue
+            entry = _normalize_entry(entries[idx - 1])
+            title = entry.get("title") or ""
+            if manual:
+                max_ep = max(1, min(999, int(value)))
+                note = "手动设置"
+            else:
+                eps, bangumi_id, note = await fetch_bangumi_max_ep(title)
+                if bangumi_id:
+                    entry["bangumi_id"] = bangumi_id
+                if not eps:
+                    messages.append(f"❌ 「{title}」{note}")
+                    continue
+                max_ep = eps
+            entry["max_ep"] = max_ep
+            entry["watched_ep"] = min(entry["watched_ep"], max_ep)
+            messages.append(
+                f"「{title}」总集数设为 {max_ep}（{note}），"
+                f"已看{entry['watched_ep']} · 应看第{_should_watch_ep(entry)}集"
+            )
+            changed = True
+        if changed:
+            schedule[day_key] = entries
+            self._save_schedule(group_id, schedule)
+        return messages
 
     async def _yield_day_row(self, event: AstrMessageEvent, group_id: str, day_idx: int):
         schedule = self._load_schedule(group_id)
@@ -935,17 +1168,20 @@ class AnimeSchedulePlugin(Star):
         if not m:
             yield event.plain_result(
                 "用法：番剧上传 周X 番剧名称 [总集数] + 图片\n"
-                "示例：番剧上传 周一 葬送的芙莉莲 12（附图或引用带图消息）"
+                "示例：番剧上传 周一 葬送的芙莉莲（未填集数时自动查 Bangumi）\n"
+                "或：番剧上传 周一 葬送的芙莉莲 12（手动指定总集数）"
             )
             return
 
         day_idx = _parse_day_token(m.group(1))
         title = m.group(2).strip()
         max_ep = DEFAULT_MAX_EP
+        manual_max = False
         title_max = re.match(r"^(.+?)\s+(\d{1,3})$", title)
         if title_max:
             title = title_max.group(1).strip()
             max_ep = max(1, min(999, int(title_max.group(2))))
+            manual_max = True
         if not day_idx:
             yield event.plain_result(f"无法识别星期：{m.group(1)}，请使用 周一~周日")
             return
@@ -973,6 +1209,17 @@ class AnimeSchedulePlugin(Star):
         if not title and reply_text:
             title = reply_text
 
+        bangumi_id = None
+        bangumi_note = ""
+        if not manual_max:
+            yield event.plain_result(f"🔎 正在从 Bangumi 查询「{title}」总集数…")
+            eps, bangumi_id, bangumi_note = await fetch_bangumi_max_ep(title)
+            if eps:
+                max_ep = eps
+            else:
+                bangumi_note = bangumi_note or "未查到集数"
+                bangumi_note += f"，已使用默认 {DEFAULT_MAX_EP} 集"
+
         entry = {
             "id": str(uuid.uuid4()),
             "title": title,
@@ -980,17 +1227,19 @@ class AnimeSchedulePlugin(Star):
             "watched_ep": 0,
             "max_ep": max_ep,
             "last_watched_date": None,
+            "bangumi_id": bangumi_id,
             "added_by": user_id,
             "added_at": int(time.time()),
         }
         schedule.setdefault(day_key, []).append(entry)
         self._save_schedule(group_id, schedule)
         idx = len(schedule[day_key])
+        extra = f"\n{bangumi_note}" if bangumi_note else ""
         yield event.chain_result([
             Comp.Reply(id=str(event.message_obj.message_id)),
             Comp.Plain(
                 f"✅ 已添加到 {DAY_NAMES[day_idx - 1]}：{title}（#{idx}，"
-                f"应看第1集/共{max_ep}集）"
+                f"应看第1集/共{max_ep}集）{extra}"
             ),
         ])
 
@@ -1013,10 +1262,11 @@ class AnimeSchedulePlugin(Star):
             if not msg and not self._is_reply_to_push(event, group_id):
                 yield event.plain_result(
                     "用法：\n"
-                    "  已看 周X 编号\n"
-                    "  已看 编号（默认今天）\n"
+                    "  已看 周X          当天全部标记看过\n"
+                    "  已看 周X 编号     指定番剧\n"
+                    "  已看 编号         默认今天\n"
                     "  已看全部\n"
-                    "示例：已看 周一 1  /  已看 1 2  /  已看全部"
+                    "示例：已看 周一  /  已看 周一 1  /  已看全部"
                 )
                 return
             messages = self._apply_mark_all_today(group_id)
@@ -1036,6 +1286,14 @@ class AnimeSchedulePlugin(Star):
                 day_idx = _parse_day_token(first)
                 tokens = tokens[1:]
 
+        # 只写了周X：对该天全部操作
+        if not tokens:
+            messages = self._apply_mark_day(group_id, day_idx)
+            yield event.plain_result(
+                f"✅ 已更新 {DAY_NAMES[day_idx - 1]} 全部进度：\n" + "\n".join(messages)
+            )
+            return
+
         indices: list[int] = []
         for tok in tokens:
             if tok.isdigit():
@@ -1054,7 +1312,7 @@ class AnimeSchedulePlugin(Star):
                 yield event.plain_result(f"找不到番剧：{tok}")
                 return
         if not indices:
-            yield event.plain_result("请指定编号，如：已看 1  或  已看 周一 1")
+            yield event.plain_result("请指定编号，如：已看 1  或  已看 周一 1；只写「已看 周一」可当天全部")
             return
         messages = self._apply_mark_indices(group_id, day_idx, indices)
         yield event.plain_result("✅ 进度已更新：\n" + "\n".join(messages))
@@ -1082,27 +1340,36 @@ class AnimeSchedulePlugin(Star):
             return
 
         day_idx = _today_weekday()
-        if day_token and day_token.isdigit() and not str(index).strip():
+        day_token = (day_token or "").strip()
+        index = (index or "").strip()
+
+        # 撤回 周一 → 当天全部
+        if day_token and _parse_day_token(day_token) and not index:
+            day_idx = _parse_day_token(day_token)
+            messages = self._apply_undo_day(group_id, day_idx)
+            yield event.plain_result(
+                f"✅ 已撤回 {DAY_NAMES[day_idx - 1]} 全部进度：\n" + "\n".join(messages)
+            )
+            return
+
+        if day_token and day_token.isdigit() and not index:
             index = day_token
         elif _parse_day_token(day_token):
             day_idx = _parse_day_token(day_token)
-        if not str(index).strip().isdigit():
-            yield event.plain_result("用法：撤回 周X 编号  或  撤回 编号（默认今天）")
-            return
-        idx = int(index)
-        entry, schedule, entries = self._find_entry(group_id, day_idx, idx)
-        if not entry:
+        if not index.isdigit():
             yield event.plain_result(
-                f"编号超出范围，{DAY_NAMES[day_idx - 1]} 当前共 {len(entries or [])} 部"
+                "用法：\n"
+                "  撤回 周X        当天全部各撤回一集\n"
+                "  撤回 周X 编号   指定番剧\n"
+                "  撤回 编号       默认今天"
             )
             return
-        ok, msg = _undo_watched_one(entry)
-        if ok:
-            schedule[str(day_idx)] = entries
-            self._save_schedule(group_id, schedule)
-            yield event.plain_result(f"✅ {msg}")
+        idx = int(index)
+        messages = self._apply_undo_indices(group_id, day_idx, [idx])
+        if len(messages) == 1 and messages[0].startswith("❌"):
+            yield event.plain_result(messages[0])
         else:
-            yield event.plain_result(f"❌ {msg}")
+            yield event.plain_result("✅ " + "\n".join(messages))
 
     @filter.command("番剧已看", alias={"/番剧已看"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -1116,26 +1383,37 @@ class AnimeSchedulePlugin(Star):
             yield event.plain_result(f"❌ {deny}")
             return
         day_idx = _parse_day_token(day_token)
-        if not day_idx or not str(index).isdigit() or not str(value).isdigit():
-            yield event.plain_result("用法：番剧已看 周X 编号 N（如 番剧已看 周一 1 3）")
-            return
-        idx = int(index)
-        entry, schedule, entries = self._find_entry(group_id, day_idx, idx)
-        if not entry:
+        index = (index or "").strip()
+        value = (value or "").strip()
+
+        # 番剧已看 周一 5 → 当天全部设为已看 5
+        if day_idx and index.isdigit() and not value:
+            watched = int(index)
+            schedule = self._load_schedule(group_id)
+            entries = schedule.get(str(day_idx), [])
+            if not entries:
+                yield event.plain_result(f"{DAY_NAMES[day_idx - 1]} 暂无番剧")
+                return
+            messages = self._apply_set_watched_indices(
+                group_id, day_idx, list(range(1, len(entries) + 1)), watched
+            )
             yield event.plain_result(
-                f"编号超出范围，{DAY_NAMES[day_idx - 1]} 当前共 {len(entries or [])} 部"
+                f"✅ 已设置 {DAY_NAMES[day_idx - 1]} 全部已看为 {watched}：\n"
+                + "\n".join(messages)
             )
             return
-        entry = _normalize_entry(entry)
-        n = max(0, min(entry["max_ep"], int(value)))
-        entry["watched_ep"] = n
-        entry["last_watched_date"] = _today_date_str() if n > 0 else None
-        schedule[str(day_idx)] = entries
-        self._save_schedule(group_id, schedule)
-        yield event.plain_result(
-            f"✅ 「{entry.get('title', '')}」已看设为 {n} 集，"
-            f"应看第{_should_watch_ep(entry)}集/{entry['max_ep']}"
-        )
+
+        if not day_idx or not index.isdigit() or not value.isdigit():
+            yield event.plain_result(
+                "用法：\n"
+                "  番剧已看 周X N         当天全部设为已看 N 集\n"
+                "  番剧已看 周X 编号 N    指定番剧\n"
+                "示例：番剧已看 周一 3  /  番剧已看 周一 1 3"
+            )
+            return
+        idx = int(index)
+        messages = self._apply_set_watched_indices(group_id, day_idx, [idx], int(value))
+        yield event.plain_result("✅ " + "\n".join(messages))
 
     @filter.command("番剧上限", alias={"/番剧上限"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -1149,26 +1427,64 @@ class AnimeSchedulePlugin(Star):
             yield event.plain_result(f"❌ {deny}")
             return
         day_idx = _parse_day_token(day_token)
-        if not day_idx or not str(index).isdigit() or not str(value).isdigit():
-            yield event.plain_result("用法：番剧上限 周X 编号 N（如 番剧上限 周一 1 24）")
-            return
-        idx = int(index)
-        entry, schedule, entries = self._find_entry(group_id, day_idx, idx)
-        if not entry:
+        index = (index or "").strip()
+        value = (value or "").strip()
+        if not day_idx:
             yield event.plain_result(
-                f"编号超出范围，{DAY_NAMES[day_idx - 1]} 当前共 {len(entries or [])} 部"
+                "用法：\n"
+                "  番剧上限 周X           当天全部从 Bangumi 同步\n"
+                "  番剧上限 周X 编号      指定番剧同步 Bangumi\n"
+                "  番剧上限 周X 编号 N    指定番剧手动设置\n"
+                "  番剧上限 周X 全部 N    当天全部手动设为 N\n"
+                "示例：番剧上限 周一  /  番剧上限 周一 1  /  番剧上限 周一 全部 12"
             )
             return
-        entry = _normalize_entry(entry)
-        max_ep = max(1, min(999, int(value)))
-        entry["max_ep"] = max_ep
-        entry["watched_ep"] = min(entry["watched_ep"], max_ep)
-        schedule[str(day_idx)] = entries
-        self._save_schedule(group_id, schedule)
-        yield event.plain_result(
-            f"✅ 「{entry.get('title', '')}」总集数设为 {max_ep}，"
-            f"当前已看{entry['watched_ep']} · 应看第{_should_watch_ep(entry)}集"
-        )
+
+        schedule = self._load_schedule(group_id)
+        entries = schedule.get(str(day_idx), [])
+        if not entries:
+            yield event.plain_result(f"{DAY_NAMES[day_idx - 1]} 暂无番剧")
+            return
+
+        # 番剧上限 周一 → 当天全部 Bangumi
+        if not index:
+            yield event.plain_result(
+                f"🔎 正在为 {DAY_NAMES[day_idx - 1]} 共 {len(entries)} 部同步 Bangumi 总集数…"
+            )
+            messages = await self._apply_max_ep_indices(
+                group_id, day_idx, list(range(1, len(entries) + 1)), None
+            )
+            yield event.plain_result(
+                f"✅ {DAY_NAMES[day_idx - 1]} 上限已更新：\n" + "\n".join(messages)
+            )
+            return
+
+        # 番剧上限 周一 全部 12 → 当天全部手动
+        if index in ("全部", "all", "ALL") and value.isdigit():
+            messages = await self._apply_max_ep_indices(
+                group_id, day_idx, list(range(1, len(entries) + 1)), value
+            )
+            yield event.plain_result(
+                f"✅ {DAY_NAMES[day_idx - 1]} 上限已设为 {value}：\n" + "\n".join(messages)
+            )
+            return
+
+        if not index.isdigit():
+            yield event.plain_result(
+                "用法：番剧上限 周X  /  番剧上限 周X 编号  /  番剧上限 周X 编号 N  /  番剧上限 周X 全部 N"
+            )
+            return
+
+        idx = int(index)
+        if idx < 1 or idx > len(entries):
+            yield event.plain_result(
+                f"编号超出范围，{DAY_NAMES[day_idx - 1]} 当前共 {len(entries)} 部"
+            )
+            return
+        if not value:
+            yield event.plain_result(f"🔎 正在从 Bangumi 查询「{entries[idx - 1].get('title', '')}」…")
+        messages = await self._apply_max_ep_indices(group_id, day_idx, [idx], value or None)
+        yield event.plain_result("✅ " + "\n".join(messages))
 
     def _is_reply_to_push(self, event: AstrMessageEvent, group_id: str) -> bool:
         settings = self._load_settings(group_id)
