@@ -1,9 +1,9 @@
 name: astrbot_plugin_anime_schedule
 display_name: 番剧追番表
-desc: 按周一至周日记录追番列表，支持图片+文字上传，生成周表长图与今日番剧推送
-short_desc: 记录每周追番安排，一键生成番剧周表长图
-help: 「番剧上传」；「番剧图」；「今日番剧」；「移动/交换番剧」；「番剧权限1~4」；「番剧推送」
-version: v1.5.0
+desc: 按周一至周日记录追番列表与观看进度，支持表情回应更新集数、周表长图与每日推送
+short_desc: 记录每周追番安排与集数进度，一键生成番剧周表长图
+help: 「番剧上传」；「今日番剧」；「已看/已看全部」；推送表情回应；「番剧推送」
+version: v1.6.0
 author: buluge
 support_platforms:
   - aiocqhttp
