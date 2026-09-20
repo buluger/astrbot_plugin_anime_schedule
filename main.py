@@ -17,6 +17,39 @@ from astrbot.core.message.components import Image, Plain, Reply
 import astrbot.api.message_components as Comp
 
 try:
+    from .entry_progress import (
+        DEFAULT_MAX_EP,
+        _is_finished,
+        _is_paused,
+        _is_watched_today,
+        _mark_watched_one,
+        _normalize_entry,
+        _pause_one,
+        _progress_label,
+        _resume_one,
+        _set_watched_one,
+        _should_watch_ep,
+        _today_date_str,
+        _undo_watched_one,
+    )
+except ImportError:
+    from entry_progress import (
+        DEFAULT_MAX_EP,
+        _is_finished,
+        _is_paused,
+        _is_watched_today,
+        _mark_watched_one,
+        _normalize_entry,
+        _pause_one,
+        _progress_label,
+        _resume_one,
+        _set_watched_one,
+        _should_watch_ep,
+        _today_date_str,
+        _undo_watched_one,
+    )
+
+try:
     from PIL import Image as PILImage
     from PIL import ImageDraw, ImageFont
 except ImportError:
@@ -54,10 +87,9 @@ PERM_LEVELS = {
     4: "全员",
 }
 
-DEFAULT_MAX_EP = 12
 BANGUMI_API = "https://api.bgm.tv"
 BANGUMI_UA = (
-    "astrbot_plugin_anime_schedule/1.7 "
+    "astrbot_plugin_anime_schedule/1.8 "
     "(https://github.com/buluger/astrbot_plugin_anime_schedule)"
 )
 
@@ -97,11 +129,15 @@ HELP_TEXT = (
     "7. 撤回 周X / 撤回 周X 编号：撤回已看（只写周X则当天全部）\n"
     "8. 番剧已看 周X N / 周X 编号 N：设置已看集数（无编号则当天全部）\n"
     "9. 番剧上限 周X / 周X 编号 [N]：设置或同步总集数（只写周X则当天全部）\n"
-    "10. 删除/移动/交换/清空番剧：管理列表\n"
-    "11. 番剧权限1~4：设置操作权限\n"
-    "12. 番剧推送 开启/关闭/时间/立即：定时推送\n"
-    "13. 推送消息可表情回应：数字表情对应编号，👍/OK/强=全部看过\n"
-    "14. 番剧帮助：显示本帮助"
+    "10. 番剧暂停/恢复 周X 编号：停播时「已看」会自动跳过\n"
+    "11. 删除番剧 周X 编号：删除指定番剧\n"
+    "12. 移动番剧 周X 编号 周Y：将番剧移到另一天\n"
+    "13. 交换番剧 周X 编号A 周Y 编号B：交换两部番剧（可同天调序）\n"
+    "14. 清空番剧 周X / 清空番剧 全部：清空当天或本周列表\n"
+    "15. 番剧权限1~4：设置操作权限\n"
+    "16. 番剧推送 开启/关闭/时间/立即：定时推送\n"
+    "17. 推送消息可表情回应：数字表情对应编号，👍/OK/强=全部看过\n"
+    "18. 番剧帮助：显示本帮助"
 )
 
 
@@ -139,93 +175,6 @@ def _parse_day_token(token: str) -> Optional[int]:
 def _today_weekday() -> int:
     """返回 1=周一 … 7=周日。"""
     return datetime.now().isoweekday()
-
-
-def _today_date_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
-
-
-def _normalize_entry(entry: dict) -> dict:
-    """补齐集数进度字段；应看集数 = 已看 + 1（未完结时）。"""
-    if not isinstance(entry, dict):
-        return entry
-    try:
-        watched = int(entry.get("watched_ep", 0) or 0)
-    except (TypeError, ValueError):
-        watched = 0
-    try:
-        max_ep = int(entry.get("max_ep", DEFAULT_MAX_EP) or DEFAULT_MAX_EP)
-    except (TypeError, ValueError):
-        max_ep = DEFAULT_MAX_EP
-    max_ep = max(1, min(999, max_ep))
-    watched = max(0, min(watched, max_ep))
-    entry["watched_ep"] = watched
-    entry["max_ep"] = max_ep
-    if "last_watched_date" not in entry:
-        entry["last_watched_date"] = None
-    return entry
-
-
-def _should_watch_ep(entry: dict) -> int:
-    """当前应看集数：已看最新集 + 1；已完结则返回 max_ep。"""
-    entry = _normalize_entry(entry)
-    watched = entry["watched_ep"]
-    max_ep = entry["max_ep"]
-    if watched >= max_ep:
-        return max_ep
-    return watched + 1
-
-
-def _is_finished(entry: dict) -> bool:
-    entry = _normalize_entry(entry)
-    return entry["watched_ep"] >= entry["max_ep"]
-
-
-def _is_watched_today(entry: dict) -> bool:
-    return (entry.get("last_watched_date") or "") == _today_date_str()
-
-
-def _progress_label(entry: dict) -> str:
-    entry = _normalize_entry(entry)
-    watched = entry["watched_ep"]
-    max_ep = entry["max_ep"]
-    if _is_finished(entry):
-        base = f"已看{watched}集 · 已完结/{max_ep}"
-    else:
-        base = f"已看{watched}集 · 应看第{_should_watch_ep(entry)}集/{max_ep}"
-    if _is_watched_today(entry):
-        base += " · ✅今日已看"
-    return base
-
-
-def _mark_watched_one(entry: dict) -> tuple[bool, str]:
-    """标记看过一集。成功返回 (True, 说明)。"""
-    entry = _normalize_entry(entry)
-    title = entry.get("title") or "番剧"
-    if _is_finished(entry):
-        return False, f"「{title}」已看完（{entry['watched_ep']}/{entry['max_ep']}）"
-    entry["watched_ep"] = entry["watched_ep"] + 1
-    entry["last_watched_date"] = _today_date_str()
-    if _is_finished(entry):
-        return True, f"「{title}」已看第{entry['watched_ep']}集，已完结"
-    return True, (
-        f"「{title}」已看第{entry['watched_ep']}集，"
-        f"下次应看第{_should_watch_ep(entry)}集"
-    )
-
-
-def _undo_watched_one(entry: dict) -> tuple[bool, str]:
-    entry = _normalize_entry(entry)
-    title = entry.get("title") or "番剧"
-    if entry["watched_ep"] <= 0:
-        return False, f"「{title}」当前已看 0 集，无法撤回"
-    entry["watched_ep"] -= 1
-    if _is_watched_today(entry):
-        entry["last_watched_date"] = None
-    return True, (
-        f"「{title}」已撤回到已看{entry['watched_ep']}集，"
-        f"应看第{_should_watch_ep(entry)}集"
-    )
 
 
 def _pick_bangumi_eps(detail: dict) -> Optional[int]:
@@ -363,7 +312,7 @@ async def fetch_bangumi_max_ep(title: str) -> tuple[Optional[int], Optional[int]
     "anime_schedule",
     "buluge",
     "按周一至周日记录追番列表，支持进度追踪、表情回应与周表长图",
-    "1.7.0",
+    "1.8.0",
 )
 class AnimeSchedulePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -927,13 +876,16 @@ class AnimeSchedulePlugin(Star):
                         )
                     entry = _normalize_entry(entry)
                     if font_title:
-                        if _is_finished(entry):
+                        if _is_paused(entry):
+                            ep_text = f"停播 {entry['watched_ep']}/{entry['max_ep']}"
+                            ep_fill = (170, 170, 180)
+                        elif _is_finished(entry):
                             ep_text = f"完结 {entry['watched_ep']}/{entry['max_ep']}"
                             ep_fill = (255, 209, 102)
                         else:
                             ep_text = f"已看{entry['watched_ep']}·应看{_should_watch_ep(entry)}/{entry['max_ep']}"
                             ep_fill = (114, 208, 255)
-                        if _is_watched_today(entry):
+                        if _is_watched_today(entry) and not _is_paused(entry):
                             ep_text = "✓" + ep_text
                         tw3 = draw.textlength(ep_text, font=font_title) if hasattr(draw, "textlength") else 90
                         ep_x = x_poster + max(0, (poster_w - tw3) / 2)
@@ -961,6 +913,7 @@ class AnimeSchedulePlugin(Star):
             text += (
                 "\n————\n"
                 "更新进度：已看 周X / 已看 编号 / 已看全部\n"
+                "停播跳过：番剧暂停 周X 编号；恢复后才会继续更新已看\n"
                 "表情回应：数字表情=对应编号，👍/OK/强=全部看过"
             )
         return text
@@ -973,6 +926,74 @@ class AnimeSchedulePlugin(Star):
             return None, schedule, entries
         return entries[index - 1], schedule, entries
 
+    def _format_progress_result(self, ok: bool, entry: dict, msg: str) -> str:
+        """把进度操作结果格式化成提示行。"""
+        if ok:
+            return msg
+        if _is_paused(entry):
+            return f"⏸ {msg}"
+        return f"❌ {msg}"
+
+    def _resolve_day_index(
+        self, day_token: str, index: str
+    ) -> tuple[Optional[int], Optional[int], Optional[str]]:
+        """
+        解析「周X 编号」或「编号」（默认今天）。
+
+        Args:
+            day_token: 星期或编号。
+            index: 编号；当 day_token 本身是编号时可为空。
+        Returns:
+            (星期, 编号, 错误说明)；成功时错误说明为 None。
+        """
+        day_idx = _today_weekday()
+        day_token = (day_token or "").strip()
+        index = (index or "").strip()
+        # 纯数字按编号处理，避免「2」被星期别名收成周二
+        if day_token.startswith("周") or day_token.startswith("星期"):
+            parsed = _parse_day_token(day_token)
+            if not parsed:
+                return None, None, f"无法识别星期：{day_token}"
+            day_idx = parsed
+        elif day_token.isdigit() and not index:
+            index = day_token
+        elif day_token and not day_token.isdigit() and _parse_day_token(day_token):
+            day_idx = _parse_day_token(day_token)
+        elif day_token:
+            return None, None, f"无法识别星期：{day_token}"
+        if not index.isdigit():
+            return None, None, "请指定编号"
+        return day_idx, int(index), None
+
+    def _apply_pause_state_indices(
+        self, group_id: str, day_idx: int, indices: list[int], paused: bool
+    ) -> list[str]:
+        """按编号将番剧设为停播或恢复。"""
+        schedule = self._load_schedule(group_id)
+        day_key = str(day_idx)
+        entries = schedule.get(day_key, [])
+        messages = []
+        changed = False
+        action = _pause_one if paused else _resume_one
+        for idx in indices:
+            if idx < 1 or idx > len(entries):
+                messages.append(f"#{idx} 编号无效")
+                continue
+            ok, msg = action(entries[idx - 1])
+            messages.append(msg if ok else f"❌ {msg}")
+            if ok:
+                changed = True
+                title = entries[idx - 1].get("title") or ""
+                state = "暂停" if paused else "恢复"
+                logger.info(
+                    f"番剧{state}: group={group_id} day={day_idx} "
+                    f"index={idx} title={title}"
+                )
+        if changed:
+            schedule[day_key] = entries
+            self._save_schedule(group_id, schedule)
+        return messages
+
     def _apply_mark_indices(self, group_id: str, day_idx: int, indices: list[int]) -> list[str]:
         schedule = self._load_schedule(group_id)
         day_key = str(day_idx)
@@ -984,7 +1005,7 @@ class AnimeSchedulePlugin(Star):
                 messages.append(f"#{idx} 编号无效")
                 continue
             ok, msg = _mark_watched_one(entries[idx - 1])
-            messages.append(msg if ok else f"❌ {msg}")
+            messages.append(self._format_progress_result(ok, entries[idx - 1], msg))
             if ok:
                 changed = True
         if changed:
@@ -1014,7 +1035,7 @@ class AnimeSchedulePlugin(Star):
                 messages.append(f"#{idx} 编号无效")
                 continue
             ok, msg = _undo_watched_one(entries[idx - 1])
-            messages.append(msg if ok else f"❌ {msg}")
+            messages.append(self._format_progress_result(ok, entries[idx - 1], msg))
             if ok:
                 changed = True
         if changed:
@@ -1042,14 +1063,10 @@ class AnimeSchedulePlugin(Star):
                 messages.append(f"#{idx} 编号无效")
                 continue
             entry = _normalize_entry(entries[idx - 1])
-            n = max(0, min(entry["max_ep"], watched))
-            entry["watched_ep"] = n
-            entry["last_watched_date"] = _today_date_str() if n > 0 else None
-            messages.append(
-                f"「{entry.get('title', '')}」已看设为 {n} 集，"
-                f"应看第{_should_watch_ep(entry)}集/{entry['max_ep']}"
-            )
-            changed = True
+            ok, msg = _set_watched_one(entry, watched)
+            messages.append(self._format_progress_result(ok, entry, msg))
+            if ok:
+                changed = True
         if changed:
             schedule[day_key] = entries
             self._save_schedule(group_id, schedule)
@@ -1227,6 +1244,7 @@ class AnimeSchedulePlugin(Star):
             "watched_ep": 0,
             "max_ep": max_ep,
             "last_watched_date": None,
+            "paused": False,
             "bangumi_id": bangumi_id,
             "added_by": user_id,
             "added_at": int(time.time()),
@@ -1485,6 +1503,64 @@ class AnimeSchedulePlugin(Star):
             yield event.plain_result(f"🔎 正在从 Bangumi 查询「{entries[idx - 1].get('title', '')}」…")
         messages = await self._apply_max_ep_indices(group_id, day_idx, [idx], value or None)
         yield event.plain_result("✅ " + "\n".join(messages))
+
+    @filter.command("番剧暂停", alias={"/番剧暂停", "暂停番剧", "停播", "番剧停播"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def cmd_pause(self, event: AstrMessageEvent, day_token: str = "", index: str = ""):
+        """将指定番剧标记为停播，后续批量更新已看时跳过。"""
+        event.call_llm = True
+        group_id = str(event.get_group_id())
+        can, deny = await self._check_perm_async(event, group_id, "暂停番剧")
+        if not can:
+            yield event.plain_result(f"❌ {deny}")
+            return
+
+        # 解析目标星期和编号
+        day_idx, idx, err = self._resolve_day_index(day_token, index)
+        if err or day_idx is None or idx is None:
+            yield event.plain_result(
+                "用法：\n"
+                "  番剧暂停 周X 编号\n"
+                "  番剧暂停 编号       默认今天\n"
+                "示例：番剧暂停 周一 2  /  番剧暂停 2"
+            )
+            return
+
+        # 写入停播标记
+        messages = self._apply_pause_state_indices(group_id, day_idx, [idx], True)
+        if len(messages) == 1 and messages[0].startswith("❌"):
+            yield event.plain_result(messages[0])
+        else:
+            yield event.plain_result("✅ " + "\n".join(messages))
+
+    @filter.command("番剧恢复", alias={"/番剧恢复", "恢复番剧", "复播", "番剧复播"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def cmd_resume(self, event: AstrMessageEvent, day_token: str = "", index: str = ""):
+        """恢复停播番剧，之后可以继续更新已看。"""
+        event.call_llm = True
+        group_id = str(event.get_group_id())
+        can, deny = await self._check_perm_async(event, group_id, "恢复番剧")
+        if not can:
+            yield event.plain_result(f"❌ {deny}")
+            return
+
+        # 解析目标星期和编号
+        day_idx, idx, err = self._resolve_day_index(day_token, index)
+        if err or day_idx is None or idx is None:
+            yield event.plain_result(
+                "用法：\n"
+                "  番剧恢复 周X 编号\n"
+                "  番剧恢复 编号       默认今天\n"
+                "示例：番剧恢复 周一 2  /  番剧恢复 2"
+            )
+            return
+
+        # 清除停播标记
+        messages = self._apply_pause_state_indices(group_id, day_idx, [idx], False)
+        if len(messages) == 1 and messages[0].startswith("❌"):
+            yield event.plain_result(messages[0])
+        else:
+            yield event.plain_result("✅ " + "\n".join(messages))
 
     def _is_reply_to_push(self, event: AstrMessageEvent, group_id: str) -> bool:
         settings = self._load_settings(group_id)
