@@ -13,6 +13,13 @@
     "obvious_hint": true,
     "default": 10
   },
+  "watch_quota_default": {
+    "description": "默认观看名额，只用于计算今天要不要用补番补位",
+    "type": "int",
+    "hint": "1~10，默认 3。停播不计入。群内可用「番剧设置 观看名额」覆盖，不影响每日添加上限",
+    "obvious_hint": true,
+    "default": 3
+  },
   "push_hour_default": {
     "description": "默认定时推送小时（0~23）",
     "type": "int",

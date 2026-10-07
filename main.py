@@ -32,6 +32,20 @@ try:
         _today_date_str,
         _undo_watched_one,
     )
+    from .backlog_progress import (
+        add_today,
+        apply_emoji,
+        format_full_list,
+        format_today_push,
+        normalize_backlog_entry,
+        parse_upload_block,
+        pick_suggestions,
+        poster_caption,
+        set_today_count,
+        sink_finished,
+        undo_emoji,
+        undo_today,
+    )
 except ImportError:
     from entry_progress import (
         DEFAULT_MAX_EP,
@@ -47,6 +61,20 @@ except ImportError:
         _should_watch_ep,
         _today_date_str,
         _undo_watched_one,
+    )
+    from backlog_progress import (
+        add_today,
+        apply_emoji,
+        format_full_list,
+        format_today_push,
+        normalize_backlog_entry,
+        parse_upload_block,
+        pick_suggestions,
+        poster_caption,
+        set_today_count,
+        sink_finished,
+        undo_emoji,
+        undo_today,
     )
 
 try:
@@ -89,7 +117,7 @@ PERM_LEVELS = {
 
 BANGUMI_API = "https://api.bgm.tv"
 BANGUMI_UA = (
-    "astrbot_plugin_anime_schedule/1.8 "
+    "astrbot_plugin_anime_schedule/1.9 "
     "(https://github.com/buluger/astrbot_plugin_anime_schedule)"
 )
 
@@ -121,8 +149,8 @@ NUM_REACTION_IDS = {
 HELP_TEXT = (
     "📺 番剧追番表指令一览\n"
     "1. 番剧上传 周X 名称 [总集数] + 图片：添加番剧（未填总集数时自动查 Bangumi）\n"
-    "2. 番剧图 / 番剧列表：生成每周追番长图\n"
-    "3. 今日番剧：查看今天更新的番剧（含进度）\n"
+    "2. 番剧图 / 番剧列表：生成每周追番长图，底部单独一栏补番\n"
+    "3. 今日番剧：今天的新番；未满观看名额且有补番时，图和文字都追加补番\n"
     "4. 番剧 周X：查看指定星期的番剧（含进度）\n"
     "5. 已看 周X / 已看 周X 编号：标记看过（只写周X则当天全部）\n"
     "6. 已看全部：今日列表全部标记看过\n"
@@ -134,10 +162,15 @@ HELP_TEXT = (
     "12. 移动番剧 周X 编号 周Y：将番剧移到另一天\n"
     "13. 交换番剧 周X 编号A 周Y 编号B：交换两部番剧（可同天调序）\n"
     "14. 清空番剧 周X / 清空番剧 全部：清空当天或本周列表\n"
-    "15. 番剧权限1~4：设置操作权限\n"
-    "16. 番剧推送 开启/关闭/时间/立即：定时推送\n"
-    "17. 推送消息可表情回应：数字表情对应编号，👍/OK/强=全部看过\n"
-    "18. 番剧帮助：显示本帮助"
+    "15. 补番上传 名称 [总集数] [已看]：加入补番队列，多部用换行或 | 分隔\n"
+    "16. 补番：查看全部补番进度（今日/本周）\n"
+    "17. 补了 编号 / 补了 编号 N：补番 +1，或把今天改成 N 集\n"
+    "18. 补番撤回 编号 / 补番删除 编号：撤回今天 1 集，或移出队列\n"
+    "19. 番剧设置 观看名额 N：补番补位用的名额，默认 3，不影响每天可添加数量\n"
+    "20. 番剧权限1~4：设置操作权限\n"
+    "21. 番剧推送 开启/关闭/时间/立即：定时推送\n"
+    "22. 推送表情：新番消息数字=+1，赞/OK/强=全部；补番消息记今天 1~3 集\n"
+    "23. 番剧帮助：显示本帮助"
 )
 
 
@@ -311,8 +344,8 @@ async def fetch_bangumi_max_ep(title: str) -> tuple[Optional[int], Optional[int]
 @register(
     "anime_schedule",
     "buluge",
-    "按周一至周日记录追番列表，支持进度追踪、表情回应与周表长图",
-    "1.8.0",
+    "按周一至周日记录追番列表，支持补番队列、进度追踪与周表长图",
+    "1.9.0",
 )
 class AnimeSchedulePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -330,6 +363,9 @@ class AnimeSchedulePlugin(Star):
         else:
             self.perm_mode_default = 3
         self.max_per_day_default = int(getattr(config, "max_per_day_default", None) or 10)
+        self.watch_quota_default = self._clamp_watch_quota(
+            getattr(config, "watch_quota_default", None), 3
+        )
         self.push_hour_default = int(getattr(config, "push_hour_default", None) or 8)
         self.push_minute_default = int(getattr(config, "push_minute_default", None) or 0)
         self._push_task: Optional[asyncio.Task] = None
@@ -357,6 +393,20 @@ class AnimeSchedulePlugin(Star):
         return mode if mode in PERM_LEVELS else fallback
 
     @staticmethod
+    def _clamp_watch_quota(value, fallback: int = 3) -> int:
+        """观看名额只用于补番补位，范围 1~10。"""
+        try:
+            quota = int(value)
+        except (TypeError, ValueError):
+            quota = fallback
+        if quota < 1 or quota > 10:
+            try:
+                quota = int(fallback)
+            except (TypeError, ValueError):
+                quota = 3
+        return max(1, min(10, quota))
+
+    @staticmethod
     def _migrate_legacy_upload_mode(value, fallback: int = 3) -> int:
         """旧 upload_mode：0关闭 / 1仅Bot / 2全员 → 新 perm_mode。"""
         try:
@@ -373,6 +423,7 @@ class AnimeSchedulePlugin(Star):
         return {
             "perm_mode": self.perm_mode_default,
             "max_per_day": self.max_per_day_default,
+            "watch_quota": self.watch_quota_default,
             "push_enabled": False,
             "push_hour": self.push_hour_default,
             "push_minute": self.push_minute_default,
@@ -421,8 +472,10 @@ class AnimeSchedulePlugin(Star):
             path = os.path.join(self.data_root, name)
             if not os.path.isdir(path):
                 continue
-            if os.path.isfile(os.path.join(path, "schedule.json")) or os.path.isfile(
-                os.path.join(path, "settings.yml")
+            if (
+                os.path.isfile(os.path.join(path, "schedule.json"))
+                or os.path.isfile(os.path.join(path, "settings.yml"))
+                or os.path.isfile(os.path.join(path, "backlog.json"))
             ):
                 group_ids.append(name)
         return group_ids
@@ -478,6 +531,7 @@ class AnimeSchedulePlugin(Star):
         text = self._format_day_entries_text(day_idx, entries, with_tip=True)
         if header:
             text = f"{header}\n{text}"
+        backlog_text = self._format_today_backlog(group_id, day_idx)
         try:
             msg_ids = []
             text_id = await self._send_group_payload(umo, group_id, text=text, bot=bot)
@@ -488,8 +542,14 @@ class AnimeSchedulePlugin(Star):
                 img_id = await self._send_group_payload(umo, group_id, image_path=out, bot=bot)
                 if img_id:
                     msg_ids.append(str(img_id))
+            backlog_ids = []
+            if backlog_text:
+                backlog_id = await self._send_group_payload(umo, group_id, text=backlog_text, bot=bot)
+                if backlog_id:
+                    backlog_ids.append(str(backlog_id))
             settings = self._load_settings(group_id)
             settings["last_push_message_ids"] = msg_ids
+            settings["last_backlog_message_ids"] = backlog_ids
             settings["last_push_day"] = day_idx
             settings["last_push_date"] = _today_date_str()
             self._save_settings(group_id, settings)
@@ -629,6 +689,63 @@ class AnimeSchedulePlugin(Star):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(schedule, f, ensure_ascii=False, indent=2)
 
+    def _backlog_path(self, group_id: str) -> str:
+        return os.path.join(self._group_dir(group_id), "backlog.json")
+
+    def _load_backlog(self, group_id: str) -> list:
+        """读取补番队列；已完结的条目排在末尾。"""
+        path = self._backlog_path(group_id)
+        if not os.path.isfile(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                return []
+            entries = [normalize_backlog_entry(e) for e in data if isinstance(e, dict)]
+            return sink_finished(entries)
+        except Exception as e:
+            logger.error(f"读取补番数据失败: {e}")
+            return []
+
+    def _save_backlog(self, group_id: str, entries: list):
+        path = self._backlog_path(group_id)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+
+    def _airing_slot_count(self, group_id: str, day_idx: Optional[int] = None) -> int:
+        """今天仍占用观看名额的新番数量。停播的不计入。"""
+        day_idx = day_idx or _today_weekday()
+        entries = self._load_schedule(group_id).get(str(day_idx), [])
+        return sum(1 for entry in entries if not _is_paused(entry))
+
+    def _watch_quota(self, group_id: str) -> int:
+        """本群观看名额。只决定今天要不要用补番补位。"""
+        settings = self._load_settings(group_id)
+        return self._clamp_watch_quota(settings.get("watch_quota"), self.watch_quota_default)
+
+    def _today_fill_entries(self, group_id: str, day_idx: int) -> list:
+        """当天未看满时，取出用来补位的补番。"""
+        picks = pick_suggestions(
+            self._load_backlog(group_id),
+            self._airing_slot_count(group_id, day_idx),
+            self._watch_quota(group_id),
+        )
+        return [entry for _index, entry, _suggested in picks]
+
+    def _format_today_backlog(self, group_id: str, day_idx: int) -> Optional[str]:
+        """当天有空位时生成补番文字，已满则不追加。"""
+        return format_today_push(
+            self._load_backlog(group_id),
+            self._airing_slot_count(group_id, day_idx),
+            quota=self._watch_quota(group_id),
+        )
+
+    def _backlog_index_error(self, entries: list, index: int) -> Optional[str]:
+        if index < 1 or index > len(entries):
+            return f"编号超出范围，当前共 {len(entries)} 部补番"
+        return None
+
     def is_bot_admin(self, user_id: str) -> bool:
         return str(user_id) in self.admins
 
@@ -760,139 +877,208 @@ class AnimeSchedulePlugin(Star):
             except Exception as e:
                 logger.warning(f"删除图片失败 {path}: {e}")
 
+    def _schedule_layout(self, group_id: str, only_day: Optional[int]) -> dict:
+        """计算周表画布尺寸。整周图始终留补番栏；今日图只在名额未满时追加。"""
+        schedule = self._load_schedule(group_id)
+        label_w, poster_h, poster_gap = 88, 220, 10
+        row_gap, margin, canvas_w = 8, 12, 1080
+        poster_pad_top, title_gap, title_line_h = 8, 6, 22
+        ep_line_h, poster_pad_bottom = 18, 8
+        row_h = poster_pad_top + poster_h + title_gap + title_line_h + 2 + ep_line_h + poster_pad_bottom
+        poster_area_w = canvas_w - margin * 2 - label_w - poster_gap
+        day_range = [only_day] if only_day is not None else list(range(1, 8))
+        max_posters = max(1, max((len(schedule.get(str(i), [])) for i in day_range), default=1))
+        poster_w = max(120, int((poster_area_w - poster_gap * (max_posters - 1)) / max_posters))
+        if only_day is None:
+            backlog = self._load_backlog(group_id)
+            include_backlog = True
+        else:
+            backlog = self._today_fill_entries(group_id, only_day)
+            include_backlog = bool(backlog)
+        num_rows = len(day_range) + (1 if include_backlog else 0)
+        return {
+            "schedule": schedule,
+            "backlog": backlog,
+            "include_backlog": include_backlog,
+            "label_w": label_w,
+            "poster_h": poster_h,
+            "poster_gap": poster_gap,
+            "row_gap": row_gap,
+            "margin": margin,
+            "canvas_w": canvas_w,
+            "poster_pad_top": poster_pad_top,
+            "title_gap": title_gap,
+            "title_line_h": title_line_h,
+            "row_h": row_h,
+            "poster_area_w": poster_area_w,
+            "day_range": day_range,
+            "poster_w": poster_w,
+            "canvas_h": margin * 2 + row_h * num_rows + row_gap * max(0, num_rows - 1),
+            "backlog_poster_w": self._fit_poster_width(poster_area_w, poster_gap, len(backlog)),
+        }
+
+    def _fit_poster_width(self, area_w: int, gap: int, count: int) -> int:
+        """让补番封面缩进这一栏的宽度里。"""
+        if count <= 1:
+            return area_w
+        return max(1, int((area_w - gap * (count - 1)) / count))
+
+    def _airing_poster_caption(self, entry: dict) -> tuple[str, tuple]:
+        """新番封面下方的进度文案和颜色。"""
+        entry = _normalize_entry(entry)
+        if _is_paused(entry):
+            text, fill = f"停播 {entry['watched_ep']}/{entry['max_ep']}", (170, 170, 180)
+        elif _is_finished(entry):
+            text, fill = f"完结 {entry['watched_ep']}/{entry['max_ep']}", (255, 209, 102)
+        else:
+            text = f"已看{entry['watched_ep']}·应看{_should_watch_ep(entry)}/{entry['max_ep']}"
+            fill = (114, 208, 255)
+        if _is_watched_today(entry) and not _is_paused(entry):
+            text = "✓" + text
+        return text, fill
+
+    def _draw_row_label(self, draw, font_day, layout: dict, y: int, text: str, fill: tuple, highlight: bool):
+        """画左侧色块和栏名。"""
+        x_label = layout["margin"]
+        label_w, row_h = layout["label_w"], layout["row_h"]
+        draw.rectangle([x_label, y, x_label + label_w, y + row_h], fill=fill)
+        if highlight:
+            draw.rectangle(
+                [
+                    x_label - 2,
+                    y - 2,
+                    x_label + label_w + layout["poster_area_w"] + layout["poster_gap"] + 2,
+                    y + row_h + 2,
+                ],
+                outline=(255, 220, 80),
+                width=3,
+            )
+        tw = draw.textlength(text, font=font_day) if hasattr(draw, "textlength") else 56
+        draw.text(
+            (x_label + (label_w - tw) / 2, y + (row_h - 28) / 2),
+            text,
+            fill=(30, 30, 30),
+            font=font_day,
+        )
+
+    def _draw_poster_card(
+        self, img, draw, font_title, group_id: str, entry: dict,
+        x_poster: int, y: int, poster_w: int, layout: dict, ep_text: str, ep_fill: tuple,
+    ):
+        """画一张封面、标题和进度。"""
+        poster_h = layout["poster_h"]
+        poster_pad_top = layout["poster_pad_top"]
+        image_name = entry.get("image")
+        title = (entry.get("title") or "").strip()
+        full_path = os.path.join(self._group_dir(group_id), image_name) if image_name else ""
+        if full_path and os.path.isfile(full_path):
+            self._paste_poster(img, draw, font_title, full_path, x_poster, y, poster_w, poster_h, poster_pad_top)
+        else:
+            draw.rectangle(
+                [x_poster, y + poster_pad_top, x_poster + poster_w, y + poster_pad_top + poster_h],
+                fill=(50, 50, 58),
+            )
+            draw.text((x_poster + 8, y + poster_pad_top + poster_h // 2), "无封面", fill=(180, 180, 190), font=font_title)
+        self._draw_poster_title(draw, font_title, title, x_poster, y, poster_w, layout)
+        if font_title and ep_text:
+            tw3 = draw.textlength(ep_text, font=font_title) if hasattr(draw, "textlength") else 90
+            ep_x = x_poster + max(0, (poster_w - tw3) / 2)
+            ep_y = y + poster_pad_top + poster_h + layout["title_gap"] + layout["title_line_h"] + 2
+            draw.text((ep_x, ep_y), ep_text, fill=ep_fill, font=font_title)
+
+    def _paste_poster(self, img, draw, font_title, full_path: str, x_poster: int, y: int, poster_w: int, poster_h: int, poster_pad_top: int):
+        """把封面图贴进格子，失败时画占位。"""
+        try:
+            with PILImage.open(full_path) as src:
+                src = src.convert("RGB")
+                ratio = min(poster_w / max(1, src.width), poster_h / max(1, src.height))
+                nw = max(1, int(src.width * ratio))
+                nh = max(1, int(src.height * ratio))
+                resized = src.resize((nw, nh))
+                px = x_poster + (poster_w - nw) // 2
+                py = y + poster_pad_top + (poster_h - nh) // 2
+                img.paste(resized, (px, py))
+        except Exception:
+            draw.rectangle(
+                [x_poster, y + poster_pad_top, x_poster + poster_w, y + poster_pad_top + poster_h],
+                fill=(60, 60, 68),
+            )
+            draw.text((x_poster + 8, y + poster_pad_top + poster_h // 2), "加载失败", fill=(200, 200, 200), font=font_title)
+
+    def _draw_poster_title(self, draw, font_title, title: str, x_poster: int, y: int, poster_w: int, layout: dict):
+        """在封面下方画标题底。"""
+        if not title or font_title is None:
+            return
+        title_show = title if len(title) <= 10 else title[:9] + "…"
+        tw2 = draw.textlength(title_show, font=font_title) if hasattr(draw, "textlength") else 80
+        title_x = x_poster + max(0, (poster_w - tw2) / 2)
+        title_y = y + layout["poster_pad_top"] + layout["poster_h"] + layout["title_gap"]
+        title_pad_x, title_pad_y = 4, 2
+        draw.rectangle(
+            [
+                title_x - title_pad_x,
+                title_y - title_pad_y,
+                title_x + tw2 + title_pad_x,
+                title_y + layout["title_line_h"],
+            ],
+            fill=(35, 35, 42),
+        )
+        draw.text((title_x, title_y), title_show, fill=(245, 245, 250), font=font_title)
+
+    def _draw_entry_row(
+        self, img, draw, font_title, group_id: str, entries: list, y: int,
+        poster_w: int, layout: dict, empty_text: str, caption_of,
+    ):
+        """画一栏里的封面列表。"""
+        x_poster = layout["margin"] + layout["label_w"] + layout["poster_gap"]
+        if not entries:
+            draw.text((x_poster + 12, y + layout["row_h"] // 2 - 10), empty_text, fill=(120, 120, 130), font=font_title)
+            return
+        for entry in entries:
+            ep_text, ep_fill = caption_of(entry)
+            self._draw_poster_card(img, draw, font_title, group_id, entry, x_poster, y, poster_w, layout, ep_text, ep_fill)
+            x_poster += poster_w + layout["poster_gap"]
+
+    def _backlog_poster_caption(self, entry: dict) -> tuple[str, tuple]:
+        """补番封面下方的进度文案和颜色。"""
+        text, finished = poster_caption(entry)
+        fill = (255, 209, 102) if finished else (198, 168, 230)
+        return text, fill
+
     def _build_schedule_image(
         self,
         group_id: str,
         highlight_day: Optional[int] = None,
         only_day: Optional[int] = None,
     ) -> Optional[str]:
+        """生成周表长图。整周图始终带补番栏；今日图只在未看满时追加补番。"""
         if PILImage is None or ImageDraw is None:
             return None
-
-        schedule = self._load_schedule(group_id)
-        label_w = 88
-        poster_h = 220
-        poster_gap = 10
-        row_gap = 8
-        margin = 12
-        canvas_w = 1080
-        poster_pad_top = 8
-        title_gap = 6
-        title_line_h = 22
-        ep_line_h = 18
-        poster_pad_bottom = 8
-        row_h = poster_pad_top + poster_h + title_gap + title_line_h + 2 + ep_line_h + poster_pad_bottom
-        poster_area_w = canvas_w - margin * 2 - label_w - poster_gap
-        day_range = [only_day] if only_day is not None else list(range(1, 8))
-        max_posters = max(1, max((len(schedule.get(str(i), [])) for i in day_range), default=1))
-        poster_w = max(120, int((poster_area_w - poster_gap * (max_posters - 1)) / max_posters))
-        num_rows = len(day_range)
-        canvas_h = margin * 2 + row_h * num_rows + row_gap * max(0, num_rows - 1)
-
-        img = PILImage.new("RGB", (canvas_w, canvas_h), (18, 18, 20))
+        layout = self._schedule_layout(group_id, only_day)
+        img = PILImage.new("RGB", (layout["canvas_w"], layout["canvas_h"]), (18, 18, 20))
         draw = ImageDraw.Draw(img)
         font_day = _pick_cjk_font(28)
         font_title = _pick_cjk_font(16)
         if font_day is None:
             return None
 
-        y = margin
-        for day_idx in day_range:
-            day_key = str(day_idx)
-            entries = schedule.get(day_key, [])
-            color = DAY_COLORS[day_idx - 1]
-            x_label = margin
-            draw.rectangle(
-                [x_label, y, x_label + label_w, y + row_h],
-                fill=color,
+        # 周一到周日
+        y = layout["margin"]
+        for day_idx in layout["day_range"]:
+            self._draw_row_label(draw, font_day, layout, y, DAY_NAMES[day_idx - 1], DAY_COLORS[day_idx - 1], highlight_day == day_idx)
+            self._draw_entry_row(
+                img, draw, font_title, group_id, layout["schedule"].get(str(day_idx), []),
+                y, layout["poster_w"], layout, "（暂无番剧）", self._airing_poster_caption,
             )
-            day_text = DAY_NAMES[day_idx - 1]
-            if highlight_day == day_idx:
-                draw.rectangle(
-                    [x_label - 2, y - 2, x_label + label_w + poster_area_w + poster_gap + 2, y + row_h + 2],
-                    outline=(255, 220, 80),
-                    width=3,
-                )
-            tw = draw.textlength(day_text, font=font_day) if hasattr(draw, "textlength") else 56
-            draw.text(
-                (x_label + (label_w - tw) / 2, y + (row_h - 28) / 2),
-                day_text,
-                fill=(30, 30, 30),
-                font=font_day,
+            y += layout["row_h"] + layout["row_gap"]
+
+        # 补番栏：整周图始终有；今日图只在观看名额没满时追加
+        if layout["include_backlog"]:
+            self._draw_row_label(draw, font_day, layout, y, "补番", (176, 146, 196), False)
+            self._draw_entry_row(
+                img, draw, font_title, group_id, layout["backlog"],
+                y, layout["backlog_poster_w"], layout, "（暂无补番）", self._backlog_poster_caption,
             )
-
-            x_poster = x_label + label_w + poster_gap
-            if not entries:
-                draw.text((x_poster + 12, y + row_h // 2 - 10), "（暂无番剧）", fill=(120, 120, 130), font=font_title)
-            else:
-                for entry in entries:
-                    image_name = entry.get("image")
-                    title = (entry.get("title") or "").strip()
-                    full_path = os.path.join(self._group_dir(group_id), image_name) if image_name else ""
-                    if full_path and os.path.isfile(full_path):
-                        try:
-                            with PILImage.open(full_path) as src:
-                                src = src.convert("RGB")
-                                ratio = min(poster_w / max(1, src.width), poster_h / max(1, src.height))
-                                nw = max(1, int(src.width * ratio))
-                                nh = max(1, int(src.height * ratio))
-                                resized = src.resize((nw, nh))
-                                px = x_poster + (poster_w - nw) // 2
-                                py = y + poster_pad_top + (poster_h - nh) // 2
-                                img.paste(resized, (px, py))
-                        except Exception:
-                            draw.rectangle(
-                                [x_poster, y + poster_pad_top, x_poster + poster_w, y + poster_pad_top + poster_h],
-                                fill=(60, 60, 68),
-                            )
-                            draw.text((x_poster + 8, y + poster_pad_top + poster_h // 2), "加载失败", fill=(200, 200, 200), font=font_title)
-                    else:
-                        draw.rectangle(
-                            [x_poster, y + poster_pad_top, x_poster + poster_w, y + poster_pad_top + poster_h],
-                            fill=(50, 50, 58),
-                        )
-                        draw.text((x_poster + 8, y + poster_pad_top + poster_h // 2), "无封面", fill=(180, 180, 190), font=font_title)
-
-                    if title and font_title:
-                        title_show = title if len(title) <= 10 else title[:9] + "…"
-                        tw2 = draw.textlength(title_show, font=font_title) if hasattr(draw, "textlength") else 80
-                        title_x = x_poster + max(0, (poster_w - tw2) / 2)
-                        title_y = y + poster_pad_top + poster_h + title_gap
-                        title_pad_x, title_pad_y = 4, 2
-                        draw.rectangle(
-                            [
-                                title_x - title_pad_x,
-                                title_y - title_pad_y,
-                                title_x + tw2 + title_pad_x,
-                                title_y + title_line_h,
-                            ],
-                            fill=(35, 35, 42),
-                        )
-                        draw.text(
-                            (title_x, title_y),
-                            title_show,
-                            fill=(245, 245, 250),
-                            font=font_title,
-                        )
-                    entry = _normalize_entry(entry)
-                    if font_title:
-                        if _is_paused(entry):
-                            ep_text = f"停播 {entry['watched_ep']}/{entry['max_ep']}"
-                            ep_fill = (170, 170, 180)
-                        elif _is_finished(entry):
-                            ep_text = f"完结 {entry['watched_ep']}/{entry['max_ep']}"
-                            ep_fill = (255, 209, 102)
-                        else:
-                            ep_text = f"已看{entry['watched_ep']}·应看{_should_watch_ep(entry)}/{entry['max_ep']}"
-                            ep_fill = (114, 208, 255)
-                        if _is_watched_today(entry) and not _is_paused(entry):
-                            ep_text = "✓" + ep_text
-                        tw3 = draw.textlength(ep_text, font=font_title) if hasattr(draw, "textlength") else 90
-                        ep_x = x_poster + max(0, (poster_w - tw3) / 2)
-                        ep_y = y + poster_pad_top + poster_h + title_gap + title_line_h + 2
-                        draw.text((ep_x, ep_y), ep_text, fill=ep_fill, font=font_title)
-                    x_poster += poster_w + poster_gap
-            y += row_h + row_gap
 
         prefix = f"day_{only_day}" if only_day is not None else "schedule"
         out_path = os.path.join(self._group_dir(group_id), f"{prefix}_{int(time.time())}.png")
@@ -1155,6 +1341,10 @@ class AnimeSchedulePlugin(Star):
         day_idx = _today_weekday()
         async for res in self._yield_day_row(event, group_id, day_idx):
             yield res
+        # 有未完结补番时，紧跟着发一条今日建议
+        backlog_text = self._format_today_backlog(group_id, day_idx)
+        if backlog_text:
+            yield event.plain_result(backlog_text)
 
     @filter.command("番剧")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -1562,6 +1752,197 @@ class AnimeSchedulePlugin(Star):
         else:
             yield event.plain_result("✅ " + "\n".join(messages))
 
+    @filter.command("补番上传", alias={"/补番上传", "上传补番"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def cmd_backlog_upload(self, event: AstrMessageEvent):
+        """把一部或多部老番加入补番队列。图片只在上传一部时保存。"""
+        event.call_llm = True
+        group_id = str(event.get_group_id())
+        can, deny = self._check_perm(event, group_id, "上传补番")
+        if not can:
+            yield event.plain_result(f"❌ {deny}")
+            return
+
+        body = re.sub(r"^/?(?:补番上传|上传补番)\s*", "", event.message_str.strip()).strip()
+        items = parse_upload_block(body)
+        if not items:
+            yield event.plain_result(
+                "用法：补番上传 名称 [总集数] [已看]\n"
+                "多部用换行或 | 分隔，例如：\n"
+                "补番上传 钢之炼金术师 64 20 | 进击的巨人 87\n"
+                "未写总集数时自动查 Bangumi。一次上传一部时可附封面图。"
+            )
+            return
+
+        # 只给单条上传保存封面，批量文字不绑定同一张图
+        image_name = None
+        if len(items) == 1:
+            image_name = await self._optional_upload_image(event, group_id)
+        if any(max_ep is None for _title, max_ep, _watched in items):
+            yield event.plain_result("🔎 正在查询未填写总集数的补番…")
+
+        entries = self._load_backlog(group_id)
+        lines = []
+        added = 0
+        for title, max_ep, watched in items:
+            entry, line = await self._build_backlog_entry(
+                event, title, max_ep, watched, image_name if added == 0 else None
+            )
+            lines.append(line)
+            if entry:
+                entries.append(entry)
+                added += 1
+            elif image_name:
+                self._remove_image_file(group_id, image_name)
+                image_name = None
+        if added:
+            self._save_backlog(group_id, sink_finished(entries))
+            logger.info(f"补番上传: group={group_id} added={added}")
+        yield event.plain_result("\n".join(lines))
+
+    async def _optional_upload_image(self, event: AstrMessageEvent, group_id: str) -> Optional[str]:
+        """有图就保存，没有图也不报错。"""
+        image_comp = next((p for p in (event.message_obj.message or []) if isinstance(p, Image)), None)
+        reply_image, _reply_text = await self._extract_image_from_reply(event, group_id)
+        file_id = image_comp.file if image_comp else None
+        image_name = await self.download_image(event, group_id, file_id=file_id, image_comp=image_comp)
+        return image_name or reply_image
+
+    async def _build_backlog_entry(
+        self,
+        event: AstrMessageEvent,
+        title: str,
+        max_ep: Optional[int],
+        watched: Optional[int],
+        image_name: Optional[str],
+    ) -> tuple[Optional[dict], str]:
+        """解析总集数和已看集数，成功时返回可入库的条目。"""
+        bangumi_id = None
+        note = ""
+        if max_ep is None:
+            eps, bangumi_id, note = await fetch_bangumi_max_ep(title)
+            if eps:
+                max_ep = eps
+            else:
+                max_ep = DEFAULT_MAX_EP
+                note = (note or "未查到集数") + f"，已使用默认 {DEFAULT_MAX_EP} 集"
+        else:
+            max_ep = max(1, min(999, int(max_ep)))
+        watched_ep = 0 if watched is None else max(0, int(watched))
+        if watched_ep > max_ep:
+            return None, f"❌ 「{title}」已看 {watched_ep} 超过总集数 {max_ep}"
+        entry = normalize_backlog_entry({
+            "id": str(uuid.uuid4()),
+            "title": title,
+            "image": image_name or "",
+            "watched_ep": watched_ep,
+            "max_ep": max_ep,
+            "logs": [],
+            "bangumi_id": bangumi_id,
+            "added_by": str(event.get_sender_id()),
+            "added_at": int(time.time()),
+        })
+        extra = f"（{note}）" if note else ""
+        return entry, f"✅ 已加入补番：{title}（已看 {watched_ep}/{max_ep}）{extra}"
+
+    @filter.command("补番", alias={"/补番", "补番列表", "/补番列表"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def cmd_backlog_list(self, event: AstrMessageEvent):
+        """查看完整补番队列。"""
+        event.call_llm = True
+        group_id = str(event.get_group_id())
+        yield event.plain_result(format_full_list(self._load_backlog(group_id)))
+
+    @filter.command("补了", alias={"/补了"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def cmd_backlog_watched(self, event: AstrMessageEvent):
+        """补了 编号 为 +1；补了 编号 N 把今天改成 N 集。"""
+        event.call_llm = True
+        group_id = str(event.get_group_id())
+        can, deny = await self._check_perm_async(event, group_id, "更新补番")
+        if not can:
+            yield event.plain_result(f"❌ {deny}")
+            return
+
+        tokens = re.sub(r"^/?补了\s*", "", event.message_str.strip()).split()
+        if not tokens or not tokens[0].isdigit() or (len(tokens) > 1 and not tokens[1].isdigit()):
+            yield event.plain_result(
+                "用法：\n"
+                "  补了 编号        今天 +1 集\n"
+                "  补了 编号 N      把今天改成 N 集\n"
+                "示例：补了 1  /  补了 2 3"
+            )
+            return
+
+        index = int(tokens[0])
+        if len(tokens) > 1 and int(tokens[1]) < 1:
+            yield event.plain_result("今天的集数至少为 1。撤回请用「补番撤回 编号」")
+            return
+        if len(tokens) == 1:
+            message = self._update_backlog_entry(group_id, index, lambda entry: add_today(entry, 1))
+        else:
+            count = int(tokens[1])
+            message = self._update_backlog_entry(
+                group_id, index, lambda entry: set_today_count(entry, count)
+            )
+        yield event.plain_result(message if message.startswith("❌") else "✅ " + message)
+
+    @filter.command("补番撤回", alias={"/补番撤回"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def cmd_backlog_undo(self, event: AstrMessageEvent, index: str = ""):
+        """撤回指定补番今天的 1 集。"""
+        event.call_llm = True
+        group_id = str(event.get_group_id())
+        can, deny = await self._check_perm_async(event, group_id, "撤回补番")
+        if not can:
+            yield event.plain_result(f"❌ {deny}")
+            return
+        if not str(index).strip().isdigit():
+            yield event.plain_result("用法：补番撤回 编号")
+            return
+        message = self._update_backlog_entry(group_id, int(index), undo_today)
+        yield event.plain_result(message if message.startswith("❌") else "✅ " + message)
+
+    @filter.command("补番删除", alias={"/补番删除"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def cmd_backlog_delete(self, event: AstrMessageEvent, index: str = ""):
+        """把指定补番移出队列。"""
+        event.call_llm = True
+        group_id = str(event.get_group_id())
+        can, deny = self._check_perm(event, group_id, "删除补番")
+        if not can:
+            yield event.plain_result(f"❌ {deny}")
+            return
+        if not str(index).strip().isdigit():
+            yield event.plain_result("用法：补番删除 编号")
+            return
+        entries = self._load_backlog(group_id)
+        idx = int(index)
+        err = self._backlog_index_error(entries, idx)
+        if err:
+            yield event.plain_result(f"❌ {err}")
+            return
+        removed = entries.pop(idx - 1)
+        self._remove_image_file(group_id, removed.get("image"))
+        self._save_backlog(group_id, entries)
+        logger.info(f"补番删除: group={group_id} index={idx} title={removed.get('title', '')}")
+        yield event.plain_result(f"✅ 已从补番队列删除 #{idx}：{removed.get('title', '')}")
+
+    def _update_backlog_entry(self, group_id: str, index: int, mutator) -> str:
+        """更新一条补番并在完结后把该条沉到队尾。"""
+        entries = self._load_backlog(group_id)
+        err = self._backlog_index_error(entries, index)
+        if err:
+            return f"❌ {err}"
+        entry = entries[index - 1]
+        title = entry.get("title") or ""
+        ok, msg = mutator(entry)
+        if not ok:
+            return f"❌ {msg}"
+        self._save_backlog(group_id, sink_finished(entries))
+        logger.info(f"补番进度: group={group_id} index={index} title={title} detail={msg}")
+        return msg
+
     def _is_reply_to_push(self, event: AstrMessageEvent, group_id: str) -> bool:
         settings = self._load_settings(group_id)
         push_ids = {str(x) for x in (settings.get("last_push_message_ids") or [])}
@@ -1573,6 +1954,44 @@ class AnimeSchedulePlugin(Star):
         if not reply_comp:
             return False
         return str(reply_comp.id) in push_ids
+
+    def _collect_reaction_emoji_ids(self, raw: dict) -> list[str]:
+        """从表情回应通知里取出 emoji_id。"""
+        emoji_ids = []
+        likes = raw.get("likes")
+        if isinstance(likes, list):
+            for item in likes:
+                if isinstance(item, dict) and item.get("emoji_id") is not None:
+                    emoji_ids.append(str(item.get("emoji_id")))
+        if raw.get("emoji_id") is not None:
+            emoji_ids.append(str(raw.get("emoji_id")))
+        return emoji_ids
+
+    async def _apply_backlog_reaction(self, event: AstrMessageEvent, group_id: str, raw: dict, emoji_ids: list):
+        """补番推送上的数字表情：一部时表示集数，多部时表示编号。"""
+        numbers = [NUM_REACTION_IDS[eid] for eid in emoji_ids if eid in NUM_REACTION_IDS]
+        if not numbers:
+            yield event.plain_result("📚 补番请贴数字表情。只有一部时 1/2/3 表示今天看了几集；多部时数字是编号。")
+            return
+        entries = self._load_backlog(group_id)
+        airing_count = self._airing_slot_count(group_id)
+        quota = self._watch_quota(group_id)
+        removing = raw.get("is_add") is False
+        action = undo_emoji if removing else apply_emoji
+        messages = []
+        changed = False
+        for number in numbers:
+            entries, ok, msg = action(entries, number, airing_count, quota)
+            messages.append(msg if ok else f"❌ {msg}")
+            if ok:
+                changed = True
+        if changed:
+            self._save_backlog(group_id, entries)
+            logger.info(
+                f"补番表情: group={group_id} numbers={numbers} remove={removing}"
+            )
+        prefix = "📚 补番表情：已撤回\n" if removing else "📚 补番表情：进度已更新\n"
+        yield event.plain_result(prefix + "\n".join(messages))
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_reaction(self, event: AstrMessageEvent):
@@ -1596,12 +2015,16 @@ class AnimeSchedulePlugin(Star):
             return
         settings = self._load_settings(group_id)
         push_ids = {str(x) for x in (settings.get("last_push_message_ids") or [])}
+        backlog_ids = {str(x) for x in (settings.get("last_backlog_message_ids") or [])}
         target_mid = str(raw.get("message_id") or "")
-        if not push_ids or target_mid not in push_ids:
+        is_backlog = bool(backlog_ids) and target_mid in backlog_ids
+        is_airing = bool(push_ids) and target_mid in push_ids
+        if not is_backlog and not is_airing:
             return
         if settings.get("last_push_date") != _today_date_str():
             return
-        if raw.get("is_add") is False:
+        # 新番消息取消表情不回退；补番消息取消表情收回今天 1 集
+        if raw.get("is_add") is False and not is_backlog:
             return
 
         can, deny = await self._check_perm_async(event, group_id, "更新进度")
@@ -1609,15 +2032,12 @@ class AnimeSchedulePlugin(Star):
             yield event.plain_result(f"❌ {deny}")
             return
 
-        emoji_ids = []
-        likes = raw.get("likes")
-        if isinstance(likes, list):
-            for item in likes:
-                if isinstance(item, dict) and item.get("emoji_id") is not None:
-                    emoji_ids.append(str(item.get("emoji_id")))
-        if raw.get("emoji_id") is not None:
-            emoji_ids.append(str(raw.get("emoji_id")))
+        emoji_ids = self._collect_reaction_emoji_ids(raw)
         if not emoji_ids:
+            return
+        if is_backlog:
+            async for result in self._apply_backlog_reaction(event, group_id, raw, emoji_ids):
+                yield result
             return
 
         day_idx = int(settings.get("last_push_day") or _today_weekday())
@@ -1847,6 +2267,21 @@ class AnimeSchedulePlugin(Star):
         self._save_settings(group_id, settings)
         yield event.plain_result(f"✅ 番剧操作权限已设为：{mode}（{PERM_LEVELS[mode]}）")
 
+    def _save_watch_quota(self, group_id: str, settings: dict, value: str) -> str:
+        """保存观看名额。这个数字不限制每天能添加几部番。"""
+        if not str(value).strip().isdigit():
+            return "用法：番剧设置 观看名额 3（1~10）。只用于计算今天要不要补番，不影响每日上限。"
+        quota = self._clamp_watch_quota(value, self.watch_quota_default)
+        if int(value) != quota:
+            return "观看名额范围是 1~10，例如：番剧设置 观看名额 3"
+        settings["watch_quota"] = quota
+        self._save_settings(group_id, settings)
+        logger.info(f"观看名额: group={group_id} quota={quota}")
+        return (
+            f"✅ 观看名额已设为 {quota}。"
+            "未看满时今日番剧会用补番补位，停播的番不计入；每天能添加几部仍由「每日上限」决定。"
+        )
+
     @filter.command("番剧设置")
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def cmd_settings(self, event: AstrMessageEvent, feature: str = "", value: str = ""):
@@ -1866,10 +2301,11 @@ class AnimeSchedulePlugin(Star):
             perm = self._get_perm_mode(group_id)
             yield event.plain_result(
                 f"番剧设置\n"
-                f"每日上限：{settings.get('max_per_day', self.max_per_day_default)}\n"
+                f"每日上限：{settings.get('max_per_day', self.max_per_day_default)}（每天可添加的数量）\n"
+                f"观看名额：{self._watch_quota(group_id)}（未看满时用补番补位，停播不计入）\n"
                 f"操作权限：{perm}（{PERM_LEVELS[perm]}）\n"
                 f"定时推送：{'开启' if push_enabled else '关闭'}（{self._format_push_time(push_hour, push_minute)}）\n"
-                "设置示例：番剧设置 每日上限 10"
+                "设置示例：番剧设置 每日上限 10  /  番剧设置 观看名额 3"
             )
             return
 
@@ -1883,7 +2319,12 @@ class AnimeSchedulePlugin(Star):
             yield event.plain_result(f"✅ 每天最多可添加 {n} 部番剧")
             return
 
-        yield event.plain_result("未知设置项，目前支持：每日上限")
+        if feature in ("观看名额", "每日番剧名额", "补番名额"):
+            message = self._save_watch_quota(group_id, settings, value)
+            yield event.plain_result(message)
+            return
+
+        yield event.plain_result("未知设置项，目前支持：每日上限、观看名额")
 
     @filter.command("番剧推送", alias={"/番剧推送"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
@@ -1920,7 +2361,7 @@ class AnimeSchedulePlugin(Star):
             hour = int(settings.get("push_hour", self.push_hour_default))
             minute = int(settings.get("push_minute", self.push_minute_default))
             yield event.plain_result(
-                f"✅ 已开启本群定时推送，每天 {self._format_push_time(hour, minute)} 自动发送今日番剧"
+                f"✅ 已开启本群定时推送，每天 {self._format_push_time(hour, minute)} 自动发送今日番剧；有补番时会再发一条"
             )
             return
 
