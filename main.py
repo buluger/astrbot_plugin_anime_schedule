@@ -42,6 +42,7 @@ try:
         pick_suggestions,
         poster_caption,
         set_today_count,
+        set_watched_total,
         sink_finished,
         undo_emoji,
         undo_today,
@@ -72,6 +73,7 @@ except ImportError:
         pick_suggestions,
         poster_caption,
         set_today_count,
+        set_watched_total,
         sink_finished,
         undo_emoji,
         undo_today,
@@ -148,29 +150,16 @@ NUM_REACTION_IDS = {
 
 HELP_TEXT = (
     "📺 番剧追番表指令一览\n"
-    "1. 番剧上传 周X 名称 [总集数] + 图片：添加番剧（未填总集数时自动查 Bangumi）\n"
-    "2. 番剧图 / 番剧列表：生成每周追番长图，底部单独一栏补番\n"
-    "3. 今日番剧：今天的新番；未满观看名额且有补番时，图和文字都追加补番\n"
-    "4. 番剧 周X：查看指定星期的番剧（含进度）\n"
-    "5. 已看 周X / 已看 周X 编号：标记看过（只写周X则当天全部）\n"
-    "6. 已看全部：今日列表全部标记看过\n"
-    "7. 撤回 周X / 撤回 周X 编号：撤回已看（只写周X则当天全部）\n"
-    "8. 番剧已看 周X N / 周X 编号 N：设置已看集数（无编号则当天全部）\n"
-    "9. 番剧上限 周X / 周X 编号 [N]：设置或同步总集数（只写周X则当天全部）\n"
-    "10. 番剧暂停/恢复 周X 编号：停播时「已看」会自动跳过\n"
-    "11. 删除番剧 周X 编号：删除指定番剧\n"
-    "12. 移动番剧 周X 编号 周Y：将番剧移到另一天\n"
-    "13. 交换番剧 周X 编号A 周Y 编号B：交换两部番剧（可同天调序）\n"
-    "14. 清空番剧 周X / 清空番剧 全部：清空当天或本周列表\n"
-    "15. 补番上传 名称 [总集数] [已看]：加入补番队列，多部用换行或 | 分隔\n"
-    "16. 补番：查看全部补番进度（今日/本周）\n"
-    "17. 补了 编号 / 补了 编号 N：补番 +1，或把今天改成 N 集\n"
-    "18. 补番撤回 编号 / 补番删除 编号：撤回今天 1 集，或移出队列\n"
-    "19. 番剧设置 观看名额 N：补番补位用的名额，默认 3，不影响每天可添加数量\n"
-    "20. 番剧权限1~4：设置操作权限\n"
-    "21. 番剧推送 开启/关闭/时间/立即：定时推送\n"
-    "22. 推送表情：新番消息数字=+1，赞/OK/强=全部；补番消息记今天 1~3 集\n"
-    "23. 番剧帮助：显示本帮助"
+    "【查看】今日番剧 / 番剧 周X / 番剧图\n"
+    "【新番】番剧上传 周X 名称 [总集数] + 图片\n"
+    "【进度】已看 / 已看全部 / 撤回 / 番剧已看 周X [编号] N\n"
+    "【集数】番剧上限 周X [编号] [N]：同步 Bangumi 或手动设置\n"
+    "【停播】番剧暂停/恢复 周X 编号（停播时「已看」会跳过）\n"
+    "【管理】删除/移动/交换/清空番剧\n"
+    "【补番】补番上传 / 补番 / 补了 / 补番已看 / 补番撤回 / 补番删除\n"
+    "【设置】番剧权限1~4 / 番剧设置 每日上限|观看名额 / 番剧推送\n"
+    "【表情】新番：数字=+1，赞/OK/强=全部；补番：1~3 集\n"
+    "详情可看 README，或对具体命令少写参数查看用法。"
 )
 
 
@@ -429,6 +418,7 @@ class AnimeSchedulePlugin(Star):
             "push_minute": self.push_minute_default,
             "push_umo": None,
             "last_push_date": None,
+            "last_scheduled_push_date": None,
             "last_push_message_ids": [],
             "last_push_day": None,
         }
@@ -504,27 +494,49 @@ class AnimeSchedulePlugin(Star):
                 logger.error(f"番剧定时推送检查失败: {e}")
             await asyncio.sleep(30)
 
+    def _should_run_scheduled_push(self, settings: dict, now: datetime) -> bool:
+        """
+        判断本群此刻是否应发定时推送。
+
+        用 last_scheduled_push_date 记「今天定时是否已发」，避免「立即」测试挡住晚上的定时。
+        到点后 10 分钟内都会补发，避免 30 秒轮询刚好错过整分。
+        """
+        if not settings.get("push_enabled"):
+            return False
+        if not settings.get("push_umo"):
+            return False
+        today_str = now.strftime("%Y-%m-%d")
+        if settings.get("last_scheduled_push_date") == today_str:
+            return False
+        hour = int(settings.get("push_hour", self.push_hour_default))
+        minute = int(settings.get("push_minute", self.push_minute_default))
+        scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        delta = (now - scheduled).total_seconds()
+        return 0 <= delta < 600
+
     async def _check_and_push_all_groups(self):
         now = datetime.now()
-        today_str = now.strftime("%Y-%m-%d")
         for group_id in self._iter_group_ids():
             settings = self._load_settings(group_id)
-            if not settings.get("push_enabled"):
+            if not self._should_run_scheduled_push(settings, now):
                 continue
             umo = settings.get("push_umo")
-            if not umo:
-                continue
-            hour = int(settings.get("push_hour", self.push_hour_default))
-            minute = int(settings.get("push_minute", self.push_minute_default))
-            if now.hour != hour or now.minute != minute:
-                continue
-            if settings.get("last_push_date") == today_str:
-                continue
-            ok = await self._send_today_push(group_id, umo, header="⏰ 今日番剧定时推送")
+            ok = await self._send_today_push(
+                group_id, umo, header="⏰ 今日番剧定时推送", mark_scheduled=True
+            )
             if ok:
                 logger.info(f"番剧定时推送成功: group={group_id}")
+            else:
+                logger.warning(f"番剧定时推送失败，将在宽限窗口内重试: group={group_id}")
 
-    async def _send_today_push(self, group_id: str, umo: str, header: str = "", bot=None) -> bool:
+    async def _send_today_push(
+        self,
+        group_id: str,
+        umo: str,
+        header: str = "",
+        bot=None,
+        mark_scheduled: bool = False,
+    ) -> bool:
         day_idx = _today_weekday()
         schedule = self._load_schedule(group_id)
         entries = schedule.get(str(day_idx), [])
@@ -552,6 +564,8 @@ class AnimeSchedulePlugin(Star):
             settings["last_backlog_message_ids"] = backlog_ids
             settings["last_push_day"] = day_idx
             settings["last_push_date"] = _today_date_str()
+            if mark_scheduled:
+                settings["last_scheduled_push_date"] = _today_date_str()
             self._save_settings(group_id, settings)
             return True
         except Exception as e:
@@ -1887,6 +1901,32 @@ class AnimeSchedulePlugin(Star):
             )
         yield event.plain_result(message if message.startswith("❌") else "✅ " + message)
 
+    @filter.command("补番已看", alias={"/补番已看"})
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def cmd_backlog_set_watched(
+        self, event: AstrMessageEvent, index: str = "", value: str = ""
+    ):
+        """直接设置补番总进度，用于纠错。"""
+        event.call_llm = True
+        group_id = str(event.get_group_id())
+        can, deny = await self._check_perm_async(event, group_id, "设置补番进度")
+        if not can:
+            yield event.plain_result(f"❌ {deny}")
+            return
+        index = (index or "").strip()
+        value = (value or "").strip()
+        if not index.isdigit() or not value.isdigit():
+            yield event.plain_result(
+                "用法：补番已看 编号 N\n"
+                "示例：补番已看 1 20（把第 1 部直接设为已看 20 集）"
+            )
+            return
+        watched = int(value)
+        message = self._update_backlog_entry(
+            group_id, int(index), lambda entry: set_watched_total(entry, watched)
+        )
+        yield event.plain_result(message if message.startswith("❌") else "✅ " + message)
+
     @filter.command("补番撤回", alias={"/补番撤回"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def cmd_backlog_undo(self, event: AstrMessageEvent, index: str = ""):
@@ -1903,21 +1943,51 @@ class AnimeSchedulePlugin(Star):
         message = self._update_backlog_entry(group_id, int(index), undo_today)
         yield event.plain_result(message if message.startswith("❌") else "✅ " + message)
 
-    @filter.command("补番删除", alias={"/补番删除"})
+    @filter.command("补番删除", alias={"/补番删除", "删除补番", "/删除补番"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def cmd_backlog_delete(self, event: AstrMessageEvent, index: str = ""):
-        """把指定补番移出队列。"""
+        """把指定补番移出队列，或一次清掉已完结的。"""
         event.call_llm = True
         group_id = str(event.get_group_id())
         can, deny = self._check_perm(event, group_id, "删除补番")
         if not can:
             yield event.plain_result(f"❌ {deny}")
             return
-        if not str(index).strip().isdigit():
-            yield event.plain_result("用法：补番删除 编号")
+        token = (index or "").strip()
+        if not token:
+            yield event.plain_result(
+                "用法：\n"
+                "  补番删除 编号     删除指定一部\n"
+                "  补番删除 完结     删除队列里所有已看完的\n"
+                "先发「补番」查看编号；已完结的会排在列表后面。"
+            )
             return
+
         entries = self._load_backlog(group_id)
-        idx = int(index)
+        if token in ("完结", "已完结", "finished"):
+            kept = []
+            removed_titles = []
+            for entry in entries:
+                if entry["watched_ep"] >= entry["max_ep"]:
+                    self._remove_image_file(group_id, entry.get("image"))
+                    removed_titles.append(entry.get("title") or "补番")
+                else:
+                    kept.append(entry)
+            if not removed_titles:
+                yield event.plain_result("当前没有已完结的补番可删")
+                return
+            self._save_backlog(group_id, kept)
+            logger.info(f"补番删除完结: group={group_id} count={len(removed_titles)}")
+            yield event.plain_result(
+                f"✅ 已删除 {len(removed_titles)} 部完结补番：\n"
+                + "\n".join(f"  · {title}" for title in removed_titles)
+            )
+            return
+
+        if not token.isdigit():
+            yield event.plain_result("用法：补番删除 编号  或  补番删除 完结")
+            return
+        idx = int(token)
         err = self._backlog_index_error(entries, idx)
         if err:
             yield event.plain_result(f"❌ {err}")
@@ -2389,6 +2459,7 @@ class AnimeSchedulePlugin(Star):
             settings["push_hour"] = hour
             settings["push_minute"] = minute
             settings["last_push_date"] = None
+            settings["last_scheduled_push_date"] = None
             self._save_settings(group_id, settings)
             yield event.plain_result(f"✅ 定时推送时间已设为每天 {self._format_push_time(hour, minute)}")
             return
@@ -2400,8 +2471,9 @@ class AnimeSchedulePlugin(Star):
                 return
             umo = settings.get("push_umo") or event.unified_msg_origin
             bot = getattr(event, "bot", None)
+            # 立即推送不占用「今日定时已发」标记，晚上定时仍会再推
             ok = await self._send_today_push(
-                group_id, umo, header="📺 今日番剧（手动测试推送）", bot=bot
+                group_id, umo, header="📺 今日番剧（手动测试推送）", bot=bot, mark_scheduled=False
             )
             if ok:
                 yield event.plain_result("✅ 测试推送已发送")

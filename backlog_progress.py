@@ -106,13 +106,21 @@ def _in_same_week(left: str, right: str) -> bool:
     return a.isocalendar()[:2] == b.isocalendar()[:2]
 
 
+def should_watch_ep(entry: dict) -> int:
+    """当前应看集数：已看 + 1；已完结则返回 max_ep。"""
+    entry = normalize_backlog_entry(entry)
+    if is_finished(entry):
+        return entry["max_ep"]
+    return entry["watched_ep"] + 1
+
+
 def poster_caption(entry: dict, today: str | None = None) -> tuple[str, bool]:
     """
     周表补番栏用的短进度。
 
     Args:
         entry: 补番条目。
-        today: 统计「今日」的日期，默认今天。
+        today: 兼容旧调用，当前文案不再展示今日增量。
     Returns:
         (文案, 是否已完结)。
     """
@@ -121,26 +129,38 @@ def poster_caption(entry: dict, today: str | None = None) -> tuple[str, bool]:
     max_ep = entry["max_ep"]
     if is_finished(entry):
         return f"完结 {watched}/{max_ep}", True
-    text = f"已看{watched}/{max_ep}"
-    current = today_count(entry, today)
-    if current:
-        text = f"今日+{current}·{text}"
-    return text, False
+    return f"已看{watched}·应看{should_watch_ep(entry)}/{max_ep}", False
 
 
 def progress_label(entry: dict, today: str | None = None) -> str:
-    """生成列表用的进度文案。"""
+    """生成列表用的进度文案：已看/应看，不再展示今日与本周增量。"""
     entry = normalize_backlog_entry(entry, today)
     watched = entry["watched_ep"]
     max_ep = entry["max_ep"]
     if is_finished(entry):
-        head = f"已看{watched}集 · 已完结/{max_ep}"
-    else:
-        head = f"已看{watched}/{max_ep}"
-    return (
-        f"{head} · 今日+{today_count(entry, today)}"
-        f" · 本周+{week_count(entry, today)}"
-    )
+        return f"已看{watched}集 · 已完结/{max_ep}"
+    return f"已看{watched}集 · 应看第{should_watch_ep(entry)}集/{max_ep}"
+
+
+def set_watched_total(entry: dict, watched: int) -> tuple[bool, str]:
+    """
+    直接把补番总进度设为指定集数，用于纠错。
+
+    Args:
+        entry: 补番条目。
+        watched: 目标已看集数。
+    Returns:
+        (是否变更, 说明文案)。
+    """
+    entry = normalize_backlog_entry(entry)
+    title = entry.get("title") or "补番"
+    n = max(0, min(entry["max_ep"], int(watched)))
+    if n == entry["watched_ep"]:
+        return False, f"「{title}」当前已是已看 {n} 集"
+    entry["watched_ep"] = n
+    # 绝对设置是纠错，清空按日记录，避免和总进度不一致
+    entry["logs"] = []
+    return True, f"「{title}」已看设为 {n} 集，{progress_label(entry)}"
 
 
 def set_today_count(entry: dict, count: int, today: str | None = None) -> tuple[bool, str]:
@@ -261,7 +281,10 @@ def format_full_list(entries: list, today: str | None = None) -> str:
     lines = [f"📚 补番共 {len(normalized)} 部："]
     for i, entry in enumerate(normalized, 1):
         lines.append(format_entry_line(i, entry, today=today))
-    lines.append("更新：补了 编号 / 补了 编号 N；撤回：补番撤回 编号")
+    lines.append(
+        "更新：补了 编号 / 补了 编号 N；直接设置：补番已看 编号 N\n"
+        "管理：补番撤回 编号 / 补番删除 编号 / 补番删除 完结"
+    )
     return "\n".join(lines)
 
 

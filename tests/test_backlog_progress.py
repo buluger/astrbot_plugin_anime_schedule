@@ -2,14 +2,17 @@ import unittest
 
 from backlog_progress import (
     add_today,
-    poster_caption,
     apply_emoji,
     cycle_today_count,
+    format_full_list,
     format_today_push,
     is_finished,
     parse_upload_block,
     pick_suggestions,
+    poster_caption,
+    progress_label,
     set_today_count,
+    set_watched_total,
     sink_finished,
     today_count,
     undo_emoji,
@@ -93,16 +96,36 @@ class TodayCountTest(unittest.TestCase):
         self.assertEqual(today_count(entry, TODAY), 1)
         self.assertEqual(entry["watched_ep"], 21)
 
-    def test_poster_caption_includes_today(self):
+    def test_poster_caption_shows_should_watch(self):
         entry = _entry(logs=[{"date": TODAY, "count": 2}], watched=22)
         text, finished = poster_caption(entry, TODAY)
         self.assertFalse(finished)
-        self.assertEqual(text, "今日+2·已看22/64")
+        self.assertEqual(text, "已看22·应看23/64")
 
     def test_poster_caption_finished(self):
         text, finished = poster_caption(_entry(watched=12, max_ep=12), TODAY)
         self.assertTrue(finished)
         self.assertEqual(text, "完结 12/12")
+
+    def test_progress_label_no_day_week_counters(self):
+        entry = _entry(logs=[{"date": TODAY, "count": 2}], watched=22)
+        label = progress_label(entry, TODAY)
+        self.assertEqual(label, "已看22集 · 应看第23集/64")
+        self.assertNotIn("今日+", label)
+        self.assertNotIn("本周+", label)
+
+    def test_set_watched_total_clears_logs(self):
+        entry = _entry(watched=22, logs=[{"date": TODAY, "count": 2}])
+        ok, msg = set_watched_total(entry, 18)
+        self.assertTrue(ok)
+        self.assertEqual(entry["watched_ep"], 18)
+        self.assertEqual(entry["logs"], [])
+        self.assertIn("已看设为 18 集", msg)
+
+    def test_full_list_mentions_delete(self):
+        text = format_full_list([_entry()])
+        self.assertIn("补番删除", text)
+        self.assertIn("补番已看", text)
 
     def test_previous_week_not_counted(self):
         entry = _entry(logs=[{"date": "2026-09-30", "count": 4}])
