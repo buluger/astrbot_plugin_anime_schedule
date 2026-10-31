@@ -526,6 +526,10 @@ class AnimeSchedulePlugin(Star):
             )
             if ok:
                 logger.info(f"番剧定时推送成功: group={group_id}")
+                try:
+                    self._auto_mark_after_push(group_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"番剧推送后自动标记失败（不影响推送）: {exc}")
             else:
                 logger.warning(f"番剧定时推送失败，将在宽限窗口内重试: group={group_id}")
 
@@ -1223,6 +1227,39 @@ class AnimeSchedulePlugin(Star):
 
     def _apply_mark_all_today(self, group_id: str) -> list[str]:
         return self._apply_mark_day(group_id, _today_weekday())
+
+    def _auto_mark_after_push(self, group_id: str) -> list[str]:
+        """定时推送成功后，自动把今天的番标成「已看」。
+
+        相当于替用户点一次「全部看过」表情，但只处理今天还没标记过的条目，
+        所以手动贴过表情的不会重复 +1。
+        """
+        if not getattr(self.config, "auto_mark_after_push", True):
+            return []
+        settings = self._load_settings(group_id)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if settings.get("last_auto_mark_date") == today_str:
+            return []
+
+        day_idx = _today_weekday()
+        schedule = self._load_schedule(group_id)
+        entries = schedule.get(str(day_idx), [])
+        indices = [
+            i
+            for i, entry in enumerate(entries, 1)
+            if not entry.get("paused")
+            and str(entry.get("last_watched_date") or "") != today_str
+        ]
+        if not indices:
+            settings["last_auto_mark_date"] = today_str
+            self._save_settings(group_id, settings)
+            return []
+
+        messages = self._apply_mark_indices(group_id, day_idx, indices)
+        settings["last_auto_mark_date"] = today_str
+        self._save_settings(group_id, settings)
+        logger.info(f"番剧自动标记已看: group={group_id}, 条目={indices}, {messages}")
+        return messages
 
     def _apply_undo_indices(self, group_id: str, day_idx: int, indices: list[int]) -> list[str]:
         schedule = self._load_schedule(group_id)

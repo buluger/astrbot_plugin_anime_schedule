@@ -33,5 +33,11 @@
     "hint": "群内可用「番剧推送 时间」覆盖",
     "obvious_hint": true,
     "default": 0
+  },
+  "auto_mark_after_push": {
+    "type": "bool",
+    "description": "定时推送后自动标记已看",
+    "hint": "开启后，每天定时推送成功时自动把当天的番集数 +1（等于替用户贴「全部看过」表情）；当天手动贴过表情的条目不会重复计数。",
+    "default": true
   }
 }
