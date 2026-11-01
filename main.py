@@ -527,9 +527,16 @@ class AnimeSchedulePlugin(Star):
             if ok:
                 logger.info(f"番剧定时推送成功: group={group_id}")
                 try:
-                    self._auto_mark_after_push(group_id)
+                    mark_results = self._auto_mark_after_push(group_id)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"番剧推送后自动标记失败（不影响推送）: {exc}")
+                    await self._notify_auto_mark_after_push(
+                        group_id, umo, None, error=exc
+                    )
+                else:
+                    await self._notify_auto_mark_after_push(
+                        group_id, umo, mark_results
+                    )
             else:
                 logger.warning(f"番剧定时推送失败，将在宽限窗口内重试: group={group_id}")
 
@@ -1227,6 +1234,50 @@ class AnimeSchedulePlugin(Star):
 
     def _apply_mark_all_today(self, group_id: str) -> list[str]:
         return self._apply_mark_day(group_id, _today_weekday())
+
+    async def _notify_auto_mark_after_push(
+        self,
+        group_id: str,
+        umo: Optional[str],
+        results: Optional[list[str]],
+        error: Optional[Exception] = None,
+    ) -> None:
+        """把定时推送后的自动标记结果通知到同一群。"""
+        if not getattr(self.config, "auto_mark_after_push", True):
+            return
+
+        if error is not None:
+            text = (
+                "⚠️ 今日番剧定时推送已成功，但自动标记已看失败。"
+                "请先核对追番表状态再手工操作，以免重复计数。"
+            )
+        elif not results:
+            text = (
+                "ℹ️ 今日番剧定时推送后，自动标记检查完成：没有需要新增标记的条目"
+                "（可能已手动标记、已暂停或当天无番剧），本次未重复增加集数。"
+            )
+        else:
+            failures = [
+                item for item in results if item.startswith(("❌", "⏸"))
+            ]
+            successes = [item for item in results if item not in failures]
+            if failures:
+                heading = (
+                    "⚠️ 今日番剧推送成功，自动标记有未成功项目"
+                    f"（{len(successes)} 项成功，{len(failures)} 项需核对）："
+                )
+            else:
+                heading = (
+                    "✅ 今日番剧推送后，已自动标记为已看"
+                    f"（{len(successes)} 部）："
+                )
+            text = heading + "\n" + "\n".join(f"· {item}" for item in results)
+
+        try:
+            await self._send_group_payload(umo, group_id, text)
+            logger.info(f"番剧自动标记通知已发送: group={group_id}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"番剧自动标记通知发送失败: group={group_id}, {exc}")
 
     def _auto_mark_after_push(self, group_id: str) -> list[str]:
         """定时推送成功后，自动把今天的番标成「已看」。
