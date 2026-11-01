@@ -1300,6 +1300,12 @@ class AnimeSchedulePlugin(Star):
             for i, entry in enumerate(entries, 1)
             if not entry.get("paused")
             and str(entry.get("last_watched_date") or "") != today_str
+            # 已完结的不用再标（否则 _mark_watched_one 会返回「已看完」，
+            # 通知里会被当成失败项，天天报「有未成功项目」）
+            and not (
+                entry.get("max_ep")
+                and int(entry.get("watched_ep") or 0) >= int(entry["max_ep"])
+            )
         ]
         if not indices:
             settings["last_auto_mark_date"] = today_str
